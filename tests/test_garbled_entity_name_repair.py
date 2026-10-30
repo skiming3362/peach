@@ -479,5 +479,96 @@ class ReviewedTests(Fixture):
         self.assertEqual(row["reason"], "missing-evidence")
 
 
+#: 标题比实体名多一种破坏方式：全角空格被折成半角后，按字节判据就对不上了。
+TITLE_CLEAN = "しんゆう\u3000-友達でも恋人でもセフレでもない２人-"
+TITLE_DAMAGED = TITLE_CLEAN.encode("gbk").decode("utf-8", errors="replace")
+
+
+class TitleTests(Fixture):
+    """作品标题走同一条错配通道：判据一样，但一个番号一部作品，只能换不能合。"""
+
+    def setUp(self):
+        super().setUp()
+        self.asset(10, "MIMK-176")
+        self.con.execute("UPDATE asset SET catalog_title=? WHERE id=10", (TITLE_DAMAGED,))
+        self.con.commit()
+
+    def title_rows(self) -> dict[int, dict]:
+        return {int(row["asset_id"]): row
+                for row in module.collect_titles(self.con, self.snapshots)}
+
+    def test_a_unique_title_on_the_same_code_is_replaced(self):
+        self.snapshot("MIMK-176", "makers", title=TITLE_CLEAN)
+        row = self.title_rows()[10]
+        self.assertEqual(row["action"], module.REPLACE)
+        self.assertEqual(row["target"], TITLE_CLEAN)
+
+    def test_the_full_width_space_survives_the_byte_check(self):
+        """全角空格是原文的一部分：折成半角就不再逐字节相等，这条判据就失效了。"""
+        self.snapshot("MIMK-176", "makers", title=TITLE_CLEAN)
+        self.assertEqual(self.title_rows()[10]["target"], TITLE_CLEAN)
+        self.assertIn("\u3000", self.title_rows()[10]["target"])
+
+    def test_a_title_from_another_code_is_not_evidence(self):
+        self.snapshot("OTHER-001", "makers", title=TITLE_CLEAN)
+        row = self.title_rows()[10]
+        self.assertEqual(row["action"], module.SKIP)
+        self.assertEqual(row["reason"], "missing-evidence")
+
+    def test_a_damaged_title_in_the_snapshot_is_not_evidence(self):
+        self.snapshot("MIMK-176", "makers", title=TITLE_DAMAGED)
+        self.assertEqual(self.title_rows()[10]["action"], module.SKIP)
+
+    def test_two_different_originals_are_left_alone(self):
+        """两个原名都能反算成坏串时，这条判据在这份数据上不再唯一，不做选择。
+
+        真实来源里确实会这样：同一部作品的打码写法与未打码写法，按 GBK→UTF-8 反算后
+        是同一个串。这时选哪个都是猜。
+        """
+        plain, masked = "輪姦計画", "輪●計画"
+        self.assertEqual(module.mangled(plain), module.mangled(masked))
+        self.con.execute("UPDATE asset SET catalog_title=? WHERE id=10",
+                         (module.mangled(plain),))
+        self.con.commit()
+        self.snapshot("MIMK-176", "makers", title=plain)
+        self.snapshot("MIMK-176", "r18dev", title=masked)
+        row = self.title_rows()[10]
+        self.assertEqual(row["action"], module.SKIP)
+        self.assertEqual(row["reason"], "ambiguous-evidence")
+
+    def test_apply_writes_the_title_and_records_the_owner(self):
+        self.snapshot("MIMK-176", "makers", title=TITLE_CLEAN)
+        with self.con:
+            counts = module.apply_titles(self.con, module.collect_titles(self.con, self.snapshots))
+        self.assertEqual(counts["replaced"], 1)
+        stored = self.con.execute("SELECT catalog_title FROM asset WHERE id=10").fetchone()[0]
+        self.assertEqual(stored, TITLE_CLEAN)
+
+    def test_apply_skips_a_title_that_moved_on(self):
+        """计划是照着收集时的值算的：值一变，算出来的原名就不再对应这一行。"""
+        self.snapshot("MIMK-176", "makers", title=TITLE_CLEAN)
+        rows = module.collect_titles(self.con, self.snapshots)
+        with self.con:
+            self.con.execute("UPDATE asset SET catalog_title='别人的标题' WHERE id=10")
+        with self.con:
+            counts = module.apply_titles(self.con, rows)
+        self.assertEqual(counts["stale"], 1)
+        self.assertEqual(self.con.execute(
+            "SELECT catalog_title FROM asset WHERE id=10").fetchone()[0], "别人的标题")
+
+    def test_a_user_written_title_is_refused(self):
+        """标题是真相字段：用户手填的值，脚本照样改不动。"""
+        self.snapshot("MIMK-176", "makers", title=TITLE_CLEAN)
+        self.con.execute(
+            "UPDATE asset SET field_owners=? WHERE id=10",
+            (json.dumps({"catalog_title": "user:manual"}),))
+        self.con.commit()
+        with self.con:
+            counts = module.apply_titles(self.con, module.collect_titles(self.con, self.snapshots))
+        self.assertEqual(counts["refused"], 1)
+        self.assertEqual(self.con.execute(
+            "SELECT catalog_title FROM asset WHERE id=10").fetchone()[0], TITLE_DAMAGED)
+
+
 if __name__ == "__main__":
     unittest.main()

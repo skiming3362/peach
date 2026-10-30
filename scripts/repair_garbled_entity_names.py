@@ -45,7 +45,9 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from peach.config import GENERATED_DIR, SOURCES_DIR   # noqa: E402
-from peach.garbled_name_repair import FIELDS, apply_rows, collect   # noqa: E402
+from peach.garbled_name_repair import (   # noqa: E402
+    FIELDS, TITLE_FIELDS, apply_rows, apply_titles, collect, collect_titles,
+)
 from peach.review_csv import read_rows, write_rows   # noqa: E402
 from peach.scripting import (   # noqa: E402
     add_ledger_write_args, counts_of, open_for_write, verify_after_write,
@@ -67,6 +69,7 @@ def _reviewed(path: Path | None) -> dict[int, str]:
 
 EXTRA_COUNTS = {
     "damaged_names": "SELECT count(*) FROM entity WHERE instr(canonical_name, '\ufffd')>0",
+    "damaged_titles": "SELECT count(*) FROM asset WHERE instr(COALESCE(catalog_title,''), '\ufffd')>0",
     "entities": "SELECT count(*) FROM entity",
     "aliases": "SELECT count(*) FROM entity_alias",
     "performer_links": "SELECT count(*) FROM asset_entity WHERE role='performer'",
@@ -82,7 +85,24 @@ def build_parser() -> argparse.ArgumentParser:
                         default=GENERATED_DIR / "garbled-entity-name-repair.csv")
     parser.add_argument("--reviewed-csv", type=Path, default=None,
                         help="人工定名，两列 entity_id,name；仍按逐字节判据校验")
+    parser.add_argument("--titles", action="store_true",
+                        help="同时修 asset.catalog_title（同一条判据，同番号快照反算原件）")
+    parser.add_argument("--title-audit-csv", type=Path,
+                        default=GENERATED_DIR / "garbled-title-repair.csv")
     return parser
+
+
+def _report_titles(rows: list[dict[str, object]], path: Path) -> None:
+    counts = Counter(str(row["action"]) for row in rows)
+    print(f"损坏作品标题 {len(rows)} 条，审计 CSV：{path}")
+    print("  动作分布：", dict(counts))
+    print("  跳过原因：", dict(Counter(str(row["reason"]) for row in rows
+                                    if row["action"] == "skip")))
+    for row in rows:
+        if row["action"] != "skip":
+            print(f"    [{row['action']}] asset #{row['asset_id']} {row['code']} "
+                  f"{row['current']!r} -> {row['target']!r}  {row['reason']}"
+                  f"（来源 {row['sources']}）")
 
 
 def run(args: argparse.Namespace) -> int:
@@ -102,6 +122,12 @@ def run(args: argparse.Namespace) -> int:
                     extra = f"  {row['split_plan']}"
                 print(f"    [{row['action']}] {row['kind']} #{row['entity_id']} "
                       f"{row['current']!r} -> {row['target']!r}{extra}  {row['reason']}")
+        title_rows: list[dict[str, object]] = []
+        if args.titles:
+            title_rows = collect_titles(connection, args.snapshots)
+            write_rows(args.title_audit_csv, TITLE_FIELDS, title_rows,
+                       atomic=True, fill_missing=True)
+            _report_titles(title_rows, args.title_audit_csv)
         if not args.apply:
             print("  未写 ledger（加 --apply --backup 才写）")
             return 0
@@ -112,6 +138,8 @@ def run(args: argparse.Namespace) -> int:
         with connection:
             connection.execute("PRAGMA foreign_keys=ON")
             result = apply_rows(connection, rows, stamp)
+            if title_rows:
+                result.update(apply_titles(connection, title_rows))
         after = counts_of(connection, EXTRA_COUNTS)
         integrity, violations = verify_after_write(connection)
         print("  写入结果：", dict(result))

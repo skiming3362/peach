@@ -24,6 +24,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from .entities import merge_entity, normalize_entity_name, rewrite_flat_projection
+from .field_owners import script_owner, write_owned_fields
 
 #: 解码失败的替换字符。它出现在名字里就说明这个名字不是任何来源写的原文。
 DAMAGE = "\ufffd"
@@ -47,6 +48,15 @@ RENAME, MERGE, SKIP, SPLIT = "rename", "merge", "skip", "split"
 RENAME_ALIAS_SOURCE = "script:repair_garbled_entity_names"
 MERGE_ALIAS_SOURCE = "merge:repair-garbled-entity-names"
 SPLIT_SOURCE = "script:split-garbled-entity-names"
+#: 作品标题也走同一条通道写坏过，同一条判据也修它；归属记成脚本，和来源抓取分开。
+TITLE_OWNER = script_owner("repair-garbled-titles")
+#: 标题与厂牌/系列写在同一张 `asset` 表上，但它是「谁写的」这件事的真相字段之一。
+TITLE_COLUMN = "catalog_title"
+#: 标题在快照里的位置；`raw` 那份是来源原始字段，两处都算证据。
+TITLE_FIELD = "title"
+TITLE_FIELDS = ("asset_id", "code", "current", "target", "sources", "action", "reason")
+#: 标题没有身份可言，处置只有两种：换成定下的原文，或留给人。
+REPLACE = "replace"
 
 
 def _key(value: object) -> str:
@@ -659,4 +669,99 @@ def apply_rows(connection: sqlite3.Connection, rows: list[dict[str, object]], no
             _apply_merge(connection, row, now, counts)
         else:
             _apply_split(connection, row, now, counts)
+    return counts
+
+
+def titles_in(payload: dict) -> set[str]:
+    """这份快照里能当证据的标题：不含 U+FFFD 的才算，坏掉的不是证据。
+
+    标题只裁首尾空白，不折内部空白：全角空格（``\\u3000``）是标题原文的一部分，折成
+    半角就改了字节，逐字节判据立刻对不上——``しんゆう　-友達でも…`` 这类标题正是栽在
+    这里。
+    """
+    found: list[object] = [payload.get(TITLE_FIELD)]
+    raw = payload.get("raw")
+    if isinstance(raw, dict):
+        found.append(raw.get(TITLE_FIELD))
+    out: set[str] = set()
+    for value in found:
+        if not isinstance(value, str):
+            continue
+        text = value.strip()
+        if text and DAMAGE not in text:
+            out.add(text)
+    return out
+
+
+def _title_candidates(index: dict[str, list[Path]], code: str,
+                      current: str) -> tuple[set[str], list[str]]:
+    """这个番号上哪些干净标题反算回来正好是账本里那个坏标题，连证据来自哪些来源。"""
+    candidates: set[str] = set()
+    sources: list[str] = []
+    for path in index.get(_key(code), ()):
+        payload = _snapshot(path)
+        if payload is None:
+            continue
+        for name in titles_in(payload):
+            if mangled(name) == current:
+                candidates.add(name)
+                sources.append(path.name.rpartition("-")[2])
+    return candidates, sources
+
+
+def collect_titles(connection: sqlite3.Connection, snapshots: Path) -> list[dict[str, object]]:
+    """找出标题被同一条错配写坏的资产，按同番号的干净快照反算原名。
+
+    标题不像实体名那样可以合并：一个番号一部作品，标题换掉就是换掉。所以只有两个结论
+    ——反算出唯一原名就换，否则留给人。多个候选说明这条判据在这份数据上不再唯一，
+    不做选择。
+    """
+    index = snapshot_index(snapshots)
+    rows: list[dict[str, object]] = []
+    for asset in connection.execute(
+            f"SELECT id,code,{TITLE_COLUMN} AS title FROM asset"
+            f" WHERE instr(COALESCE({TITLE_COLUMN},''),?)>0 ORDER BY id", (DAMAGE,)
+    ):
+        asset_id, code = int(asset[0]), str(asset[1] or "")
+        current = str(asset[2] or "")
+        row: dict[str, object] = {"asset_id": asset_id, "code": code, "current": current,
+                                  "target": "", "sources": "", "action": SKIP, "reason": ""}
+        rows.append(row)
+        if not code:
+            row["reason"] = "no-code"
+            continue
+        candidates, sources = _title_candidates(index, code, current)
+        if not candidates:
+            row["reason"] = "missing-evidence"
+            continue
+        if len(candidates) > 1:
+            row["target"] = " | ".join(sorted(candidates))
+            row["reason"] = "ambiguous-evidence"
+            continue
+        row["target"], row["sources"] = next(iter(candidates)), ",".join(sorted(set(sources)))
+        row["action"], row["reason"] = REPLACE, "verified"
+    return rows
+
+
+def apply_titles(connection: sqlite3.Connection, rows: list[dict[str, object]]) -> Counter:
+    """把定下的标题写回 `asset.catalog_title`，归属记成脚本。
+
+    现标题已经变了的整行跳过：这份计划是照着收集时的值算出来的，值一变，算出来的原名
+    就不再对应这一行。写入走 ``write_owned_fields``，用户的判断照样挡得住。
+    """
+    counts: Counter = Counter()
+    for row in rows:
+        if str(row["action"]) != REPLACE:
+            continue
+        asset_id, target = int(row["asset_id"]), str(row["target"])
+        found = connection.execute(
+            f"SELECT {TITLE_COLUMN} FROM asset WHERE id=?", (asset_id,)).fetchone()
+        if found is None or found[0] != str(row["current"]):
+            counts["stale"] += 1
+            continue
+        written = write_owned_fields(connection, [asset_id], {TITLE_COLUMN: target}, TITLE_OWNER)
+        if written.written:
+            counts["replaced"] += 1
+        elif written.refused:
+            counts["refused"] += 1
     return counts
