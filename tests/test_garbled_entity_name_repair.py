@@ -431,5 +431,53 @@ class SiblingTests(Fixture):
         self.assertEqual(rows[1]["reason"], "missing-evidence")
 
 
+class ReviewedTests(Fixture):
+    """快照自己也坏了、又没有同番号干净实体可对：这时只能人看过之后定名字。"""
+
+    def setUp(self):
+        super().setUp()
+        self.entity(1, "series", DAMAGED)
+        self.asset(10, "MIDE-044")
+        self.link(10, 1, "series")
+
+    def rows(self, reviewed):
+        return module.collect(self.con, self.snapshots, reviewed)
+
+    def test_a_reviewed_name_that_passes_the_byte_check_is_renamed(self):
+        self.assertEqual(self.rows({1: CLEAN})[0]["action"], module.RENAME)
+        self.assertEqual(self.rows({1: CLEAN})[0]["reason"], "reviewed")
+        self.assertEqual(self.rows({1: CLEAN})[0]["target"], CLEAN)
+
+    def test_a_reviewed_name_is_still_written_by_apply(self):
+        with self.con:
+            module.apply_rows(self.con, self.rows({1: CLEAN}), "2026-10-30T00:00:00Z")
+        self.assertEqual(self.con.execute(
+            "SELECT canonical_name FROM entity WHERE id=1").fetchone()[0], CLEAN)
+
+    def test_a_reviewed_name_that_does_not_match_is_not_written(self):
+        """人定的是「哪个名字」，不是「怎么绕过验证」：对不上坏串就留在复核里。"""
+        rows = self.rows({1: "别人的名字"})
+        self.assertEqual(rows[0]["action"], module.SKIP)
+        self.assertEqual(rows[0]["reason"], "reviewed-name-does-not-match")
+        with self.con:
+            counts = module.apply_rows(self.con, rows, "2026-10-30T00:00:00Z")
+        self.assertEqual(counts["renamed"], 0)
+        self.assertEqual(self.con.execute(
+            "SELECT canonical_name FROM entity WHERE id=1").fetchone()[0], DAMAGED)
+
+    def test_a_reviewed_name_already_held_by_a_sibling_is_merged(self):
+        self.entity(2, "series", CLEAN)
+        row = self.rows({1: CLEAN})[0]
+        self.assertEqual(row["action"], module.MERGE)
+        self.assertEqual(row["reason"], "reviewed")
+        self.assertEqual(row["conflict_entity_id"], 2)
+
+    def test_an_entity_without_a_reviewed_name_still_goes_through_evidence(self):
+        """没给人名的照旧走自动取证，不能因为传了复核件就整批跳过。"""
+        row = self.rows({})[0]
+        self.assertEqual(row["action"], module.SKIP)
+        self.assertEqual(row["reason"], "missing-evidence")
+
+
 if __name__ == "__main__":
     unittest.main()

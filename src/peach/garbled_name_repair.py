@@ -359,14 +359,27 @@ def _resolve_without_candidate(connection: sqlite3.Connection, row: dict, codes:
         "no-codes-no-global-match" if not codes else "missing-evidence")
 
 
-def collect(connection: sqlite3.Connection, snapshots: Path) -> list[dict[str, object]]:
-    """逐条判定损坏的规范名怎么处置：改名、合并，或留给人。"""
+def _reviewed_name(name: str, current: str) -> bool:
+    """人给的名字也要过逐字节判据：对不上损坏名就说明给错了，别拿它改账本。"""
+    return mangled(name) == current
+
+
+def collect(connection: sqlite3.Connection, snapshots: Path,
+            reviewed: dict[int, str] | None = None) -> list[dict[str, object]]:
+    """逐条判定损坏的规范名怎么处置：改名、合并，或留给人。
+
+    ``reviewed`` 是人看过之后定下的名字（键是实体 id）。它仍然要过同一条判据——按 GBK
+    编码再按 UTF-8 解码必须等于账本里那个损坏名——否则不采纳：人来定的是「哪个名字」，
+    不是「怎么绕过验证」。采纳的行走 ``rename``，reason 记成 ``reviewed``，好和来源快照
+    自动取证的那些区分开。
+    """
     connection.row_factory = sqlite3.Row
     index = snapshot_index(snapshots)
     global_names: dict[str, set[str]] = {}
     ledger = _ledger_names(connection)
     siblings: dict[str, dict[str, list[tuple[int, str]]]] = {}
     rows: list[dict[str, object]] = []
+    chosen = dict(reviewed or {})
     for entity in _damaged(connection):
         entity_id, kind = int(entity["id"]), str(entity["kind"])
         current = str(entity["canonical_name"] or "")
@@ -397,6 +410,22 @@ def collect(connection: sqlite3.Connection, snapshots: Path) -> list[dict[str, o
             "action": SKIP, "reason": "", "conflict_entity_id": "", "split_plan": "",
         }
         rows.append(row)
+        if entity_id in chosen:
+            # 人已经定过名字：先过判据，过了就直接改名，不再走自动取证（自动取证正是
+            # 在这几条上取不到证的，再跑一遍也不会变）。撞名的仍交给合并判据。
+            name = _text(chosen.pop(entity_id))
+            if not name or not _reviewed_name(name, current):
+                row["target"] = name
+                row["reason"] = "reviewed-name-does-not-match"
+                continue
+            row["target"] = name
+            clash = _clash(connection, kind, entity_id, name)
+            if clash is None:
+                row["action"], row["reason"] = RENAME, "reviewed"
+            else:
+                row["action"], row["conflict_entity_id"] = MERGE, clash
+                row["reason"] = "reviewed"
+            continue
         if not candidates:
             _resolve_without_candidate(connection, row, codes, ledger_hits, siblings)
             continue

@@ -26,6 +26,10 @@ r"""采集桥 GBK／UTF-8 错配期间写坏的实体规范名，按同番号快
 
 默认只写审计 CSV；`--apply` 才写 ledger，且必须同时给 `--backup`。改名与合并都撤不
 回来，`--apply` 前先确认这批计划已经过目。
+
+剩下的硬骨头——快照自己在同一个窗口里被写坏、又没有任何同番号干净实体可对——自动取证
+取不到证。这类可以人工定名：给 `--reviewed-csv`（列为 `entity_id,name`），人给的名字
+仍要过同一条逐字节判据，对不上的记 `reviewed-name-does-not-match` 留在审计里。
 """
 from __future__ import annotations
 
@@ -42,10 +46,24 @@ if str(SRC_DIR) not in sys.path:
 
 from peach.config import GENERATED_DIR, SOURCES_DIR   # noqa: E402
 from peach.garbled_name_repair import FIELDS, apply_rows, collect   # noqa: E402
-from peach.review_csv import write_rows   # noqa: E402
+from peach.review_csv import read_rows, write_rows   # noqa: E402
 from peach.scripting import (   # noqa: E402
     add_ledger_write_args, counts_of, open_for_write, verify_after_write,
 )
+
+
+def _reviewed(path: Path | None) -> dict[int, str]:
+    """人定下的名字：`entity_id,name` 两列。文件没给就是空。"""
+    if path is None:
+        return {}
+    found: dict[int, str] = {}
+    for row in read_rows(path, missing_ok=False):
+        raw = str(row.get("entity_id") or "").strip()
+        name = str(row.get("name") or "").strip()
+        if not raw.isdigit() or not name:
+            continue
+        found[int(raw)] = name
+    return found
 
 EXTRA_COUNTS = {
     "damaged_names": "SELECT count(*) FROM entity WHERE instr(canonical_name, '\ufffd')>0",
@@ -62,13 +80,15 @@ def build_parser() -> argparse.ArgumentParser:
                         help="来源快照目录")
     parser.add_argument("--audit-csv", type=Path,
                         default=GENERATED_DIR / "garbled-entity-name-repair.csv")
+    parser.add_argument("--reviewed-csv", type=Path, default=None,
+                        help="人工定名，两列 entity_id,name；仍按逐字节判据校验")
     return parser
 
 
 def run(args: argparse.Namespace) -> int:
     connection = open_for_write(args)
     try:
-        rows = collect(connection, args.snapshots)
+        rows = collect(connection, args.snapshots, _reviewed(args.reviewed_csv))
         write_rows(args.audit_csv, FIELDS, rows, atomic=True, fill_missing=True)
         counts = Counter(str(row["action"]) for row in rows)
         print(f"损坏规范名 {len(rows)} 条，审计 CSV：{args.audit_csv}")
