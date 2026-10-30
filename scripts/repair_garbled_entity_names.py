@@ -89,7 +89,22 @@ def build_parser() -> argparse.ArgumentParser:
                         help="同时修 asset.catalog_title（同一条判据，同番号快照反算原件）")
     parser.add_argument("--title-audit-csv", type=Path,
                         default=GENERATED_DIR / "garbled-title-repair.csv")
+    parser.add_argument("--title-reviewed-csv", type=Path, default=None,
+                        help="人工定标题，两列 asset_id,title；仍按逐字节判据校验")
     return parser
+
+
+def _reviewed_titles(path: Path | None) -> dict[int, str]:
+    if path is None:
+        return {}
+    found: dict[int, str] = {}
+    for row in read_rows(path, missing_ok=False):
+        raw = str(row.get("asset_id") or "").strip()
+        title = str(row.get("title") or "").strip()
+        if not raw.isdigit() or not title:
+            continue
+        found[int(raw)] = title
+    return found
 
 
 def _report_titles(rows: list[dict[str, object]], path: Path) -> None:
@@ -124,7 +139,8 @@ def run(args: argparse.Namespace) -> int:
                       f"{row['current']!r} -> {row['target']!r}{extra}  {row['reason']}")
         title_rows: list[dict[str, object]] = []
         if args.titles:
-            title_rows = collect_titles(connection, args.snapshots)
+            title_rows = collect_titles(connection, args.snapshots,
+                                        _reviewed_titles(args.title_reviewed_csv))
             write_rows(args.title_audit_csv, TITLE_FIELDS, title_rows,
                        atomic=True, fill_missing=True)
             _report_titles(title_rows, args.title_audit_csv)

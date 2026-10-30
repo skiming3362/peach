@@ -570,5 +570,47 @@ class TitleTests(Fixture):
             "SELECT catalog_title FROM asset WHERE id=10").fetchone()[0], TITLE_DAMAGED)
 
 
+class ReviewedTitleTests(Fixture):
+    """快照自己也坏了、又没有同番号干净快照可对：这时只能人看过之后定标题。
+
+    与实体名一样，人定的仍是「原文是哪个标题」，判据不放宽——对不上坏串就不写。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.asset(10, "107STKO-017")
+        self.con.execute("UPDATE asset SET catalog_title=? WHERE id=10", (TITLE_DAMAGED,))
+        self.con.commit()
+
+    def rows(self, reviewed):
+        return {int(row["asset_id"]): row
+                for row in module.collect_titles(self.con, self.snapshots, reviewed)}
+
+    def test_a_reviewed_title_that_passes_the_byte_check_is_replaced(self):
+        row = self.rows({10: TITLE_CLEAN})[10]
+        self.assertEqual(row["action"], module.REPLACE)
+        self.assertEqual(row["reason"], "reviewed")
+        self.assertEqual(row["target"], TITLE_CLEAN)
+
+    def test_a_reviewed_title_is_still_written_by_apply(self):
+        with self.con:
+            module.apply_titles(self.con, list(self.rows({10: TITLE_CLEAN}).values()))
+        self.assertEqual(self.con.execute(
+            "SELECT catalog_title FROM asset WHERE id=10").fetchone()[0], TITLE_CLEAN)
+
+    def test_a_reviewed_title_that_does_not_match_is_not_written(self):
+        row = self.rows({10: "别人的标题"})[10]
+        self.assertEqual(row["action"], module.SKIP)
+        self.assertEqual(row["reason"], "reviewed-title-does-not-match")
+        with self.con:
+            counts = module.apply_titles(self.con, [row])
+        self.assertEqual(counts["replaced"], 0)
+        self.assertEqual(self.con.execute(
+            "SELECT catalog_title FROM asset WHERE id=10").fetchone()[0], TITLE_DAMAGED)
+
+    def test_a_title_without_a_reviewed_value_still_goes_through_evidence(self):
+        self.assertEqual(self.rows({})[10]["reason"], "missing-evidence")
+
+
 if __name__ == "__main__":
     unittest.main()

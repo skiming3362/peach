@@ -709,14 +709,19 @@ def _title_candidates(index: dict[str, list[Path]], code: str,
     return candidates, sources
 
 
-def collect_titles(connection: sqlite3.Connection, snapshots: Path) -> list[dict[str, object]]:
+def collect_titles(connection: sqlite3.Connection, snapshots: Path,
+                   reviewed: dict[int, str] | None = None) -> list[dict[str, object]]:
     """找出标题被同一条错配写坏的资产，按同番号的干净快照反算原名。
 
     标题不像实体名那样可以合并：一个番号一部作品，标题换掉就是换掉。所以只有两个结论
     ——反算出唯一原名就换，否则留给人。多个候选说明这条判据在这份数据上不再唯一，
     不做选择。
+
+    ``reviewed`` 是复核件定下的标题（``asset_id`` → 标题）。判据对它一样成立：人定的
+    是「原文是哪个标题」，不是「怎么绕过验证」。对不上的仍留在复核里，不写账本。
     """
     index = snapshot_index(snapshots)
+    chosen = dict(reviewed or {})
     rows: list[dict[str, object]] = []
     for asset in connection.execute(
             f"SELECT id,code,{TITLE_COLUMN} AS title FROM asset"
@@ -727,6 +732,14 @@ def collect_titles(connection: sqlite3.Connection, snapshots: Path) -> list[dict
         row: dict[str, object] = {"asset_id": asset_id, "code": code, "current": current,
                                   "target": "", "sources": "", "action": SKIP, "reason": ""}
         rows.append(row)
+        if asset_id in chosen:
+            target = chosen[asset_id].strip()
+            if mangled(target) != current:
+                row["reason"] = "reviewed-title-does-not-match"
+                continue
+            row["target"], row["sources"] = target, "reviewed"
+            row["action"], row["reason"] = REPLACE, "reviewed"
+            continue
         if not code:
             row["reason"] = "no-code"
             continue
