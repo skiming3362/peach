@@ -51,6 +51,7 @@ EXTRA_COUNTS = {
     "damaged_names": "SELECT count(*) FROM entity WHERE instr(canonical_name, '\ufffd')>0",
     "entities": "SELECT count(*) FROM entity",
     "aliases": "SELECT count(*) FROM entity_alias",
+    "performer_links": "SELECT count(*) FROM asset_entity WHERE role='performer'",
 }
 
 
@@ -77,6 +78,8 @@ def run(args: argparse.Namespace) -> int:
         for row in rows:
             if row["action"] != "skip":
                 extra = f" -> #{row['conflict_entity_id']}" if row["action"] == "merge" else ""
+                if row["action"] == "split":
+                    extra = f"  {row['split_plan']}"
                 print(f"    [{row['action']}] {row['kind']} #{row['entity_id']} "
                       f"{row['current']!r} -> {row['target']!r}{extra}  {row['reason']}")
         if not args.apply:

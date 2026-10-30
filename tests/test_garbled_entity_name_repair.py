@@ -245,5 +245,117 @@ class RenameTests(Fixture):
             "SELECT canonical_name FROM entity WHERE id=1").fetchone()[0], DAMAGED)
 
 
+class SplitTests(Fixture):
+    """一个损坏名对着两个人：GBK 双字节塌进 UTF-8 的替换字符，两个人的作品并成了一条。"""
+
+    #: 两个不同的日文名，编成 GBK 再按 UTF-8 读回来是同一个损坏名。
+    FIRST = "菊乃らん"
+    SECOND = "弓乃りむ"
+
+    def setUp(self):
+        super().setUp()
+        self.assertEqual(
+            module.mangled(self.FIRST), module.mangled(self.SECOND),
+            "这组名字必须塌成同一个损坏串，用例才成立")
+        self.shared = module.mangled(self.FIRST)
+        self.entity(1, "performer", self.shared)
+        self.asset(10, "JUFE-493")
+        self.asset(11, "DASS-253")
+        self.link(10, 1, "performer")
+        self.link(11, 1, "performer")
+        self.performer_snapshot("JUFE-493", self.FIRST)
+        self.performer_snapshot("DASS-253", self.SECOND)
+
+    def apply(self):
+        with self.con:
+            return module.apply_rows(self.con, module.collect(self.con, self.snapshots),
+                                     "2026-10-30T00:00:00Z")
+
+    def test_each_work_goes_to_the_person_its_own_snapshot_names(self):
+        rows = self.rows()
+        self.assertEqual(rows[1]["action"], module.SPLIT)
+        self.assertEqual(self.apply()["split"], 1)
+        found = dict(self.con.execute(
+            "SELECT a.code,e.canonical_name FROM asset_entity ae"
+            " JOIN asset a ON a.id=ae.asset_id JOIN entity e ON e.id=ae.entity_id"
+            " WHERE ae.role='performer'"))
+        self.assertEqual(found, {"JUFE-493": self.FIRST, "DASS-253": self.SECOND})
+
+    def test_a_target_that_does_not_exist_yet_is_created(self):
+        self.apply()
+        names = sorted(row[0] for row in self.con.execute(
+            "SELECT canonical_name FROM entity WHERE kind='performer'"))
+        self.assertEqual(names, sorted([self.FIRST, self.SECOND]))
+
+    def test_the_damaged_entity_is_gone(self):
+        self.apply()
+        self.assertIsNone(self.con.execute("SELECT id FROM entity WHERE id=1").fetchone())
+
+    def test_a_tombstone_points_at_one_of_the_people(self):
+        self.apply()
+        row = self.con.execute("SELECT target_id FROM entity_redirect WHERE old_id=1").fetchone()
+        self.assertIsNotNone(row)
+        self.assertIn(self.con.execute(
+            "SELECT canonical_name FROM entity WHERE id=?", (row[0],)).fetchone()[0],
+            (self.FIRST, self.SECOND))
+
+    def test_the_damaged_actor_tag_is_rewritten_per_asset(self):
+        for asset_id in (10, 11):
+            self.con.execute(
+                "INSERT INTO asset_tag(asset_id,tag,confidence,source) VALUES(?,?,0.9,'auto:javdb')",
+                (asset_id, f"演员:{self.shared}"))
+        self.apply()
+        tags = dict(self.con.execute(
+            "SELECT asset_id,tag FROM asset_tag"))
+        self.assertEqual(tags, {10: f"演员:{self.FIRST}", 11: f"演员:{self.SECOND}"})
+
+    def test_a_code_that_names_nobody_blocks_the_whole_split(self):
+        """有一个番号指不出人，就整条不拆——宁可留在复核里，也不能把作品挂到别人名下。"""
+        self.asset(12, "UNKNOWN-001")
+        self.link(12, 1, "performer")
+        self.assertEqual(self.rows()[1]["action"], module.SKIP)
+        self.assertEqual(self.rows()[1]["reason"], "ambiguous-evidence")
+
+    def test_a_code_naming_both_people_blocks_the_whole_split(self):
+        self.performer_snapshot("JUFE-493", self.FIRST, self.SECOND)
+        self.assertEqual(self.rows()[1]["action"], module.SKIP)
+
+
+class MetadataCodeTests(Fixture):
+    """孤儿实体没有作品可挂，但它建的时候是照某份快照建的，metadata 记着那份快照的番号。"""
+
+    def test_the_entity_metadata_supplies_the_code(self):
+        self.entity(1, "performer", DAMAGED)
+        self.con.execute(
+            "UPDATE entity SET metadata_json=? WHERE id=1",
+            (json.dumps({"content_id": "MIDE894",
+                         "raw_snapshot": "D:\\sources\\MIDE-894-makers.json"}),))
+        self.performer_snapshot("MIDE-894", CLEAN, source="makers")
+        rows = self.rows()
+        self.assertEqual(rows[1]["action"], module.RENAME)
+        self.assertEqual(rows[1]["target"], CLEAN)
+
+    def test_the_two_writings_of_one_code_are_not_two_codes(self):
+        """`JUFE-493` 与元数据里的 `JUFE493` 是同一部作品，别当成两条番号去各取一次证。"""
+        self.entity(1, "performer", DAMAGED)
+        self.asset(10, "MIDE-894")
+        self.link(10, 1, "performer")
+        self.con.execute("UPDATE entity SET metadata_json=? WHERE id=1",
+                         (json.dumps({"content_id": "MIDE894"}),))
+        self.assertEqual(module._codes(self.con, 1), ["MIDE-894"])
+
+    def test_a_ledger_sibling_with_that_name_is_merged_into_it(self):
+        """快照也坏了的时候，账本里别的干净实体就是字典：唯一命中只能并过去。"""
+        self.entity(1, "performer", DAMAGED)
+        self.asset(10, "MIDE-894")
+        self.link(10, 1, "performer")
+        self.snapshot("MIDE-894", "makers", actresses=[{"japanese_name": DAMAGED}])
+        self.entity(2, "performer", CLEAN)
+        rows = self.rows()
+        self.assertEqual(rows[1]["action"], module.MERGE)
+        self.assertEqual(rows[1]["reason"], "ledger-dictionary")
+        self.assertEqual(rows[1]["conflict_entity_id"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()

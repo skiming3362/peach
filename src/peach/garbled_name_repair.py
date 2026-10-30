@@ -38,14 +38,15 @@ NAME_FIELDS = {
 
 FIELDS = (
     "entity_id", "kind", "current", "target", "assets", "codes", "snapshots", "action", "reason",
-    "conflict_entity_id",
+    "conflict_entity_id", "split_plan",
 )
 
-RENAME, MERGE, SKIP = "rename", "merge", "skip"
+RENAME, MERGE, SKIP, SPLIT = "rename", "merge", "skip", "split"
 #: 旧名不是原文、是通道故障的产物：它不留别名（按它搜不到，留着只污染检索），旧值只留在
 #: 审计 CSV 与备份里。
 RENAME_ALIAS_SOURCE = "script:repair_garbled_entity_names"
 MERGE_ALIAS_SOURCE = "merge:repair-garbled-entity-names"
+SPLIT_SOURCE = "script:split-garbled-entity-names"
 
 
 def _key(value: object) -> str:
@@ -132,6 +133,19 @@ def _clash(connection: sqlite3.Connection, kind: str, entity_id: int, name: str)
     return int(alias[0]) if alias else None
 
 
+def _occupant(connection: sqlite3.Connection, kind: str, name: str) -> int | None:
+    """这个名字对应哪条同类实体：规范名优先，别名次之，都没有返回 ``None``。"""
+    key = normalize_entity_name(name)
+    taken = connection.execute(
+        "SELECT id FROM entity WHERE kind=? AND normalized_name=? LIMIT 1", (kind, key)).fetchone()
+    if taken:
+        return int(taken[0])
+    alias = connection.execute(
+        "SELECT a.entity_id FROM entity_alias a JOIN entity e ON e.id=a.entity_id"
+        " WHERE e.kind=? AND a.normalized_alias=? ORDER BY a.entity_id LIMIT 1", (kind, key)).fetchone()
+    return int(alias[0]) if alias else None
+
+
 def _dropped_aliases(connection: sqlite3.Connection, entity_id: int) -> int:
     """损坏名不是任何来源写过的原文，不该作为别名留在任何人名下。"""
     connection.execute("DELETE FROM entity_alias WHERE entity_id=? AND instr(alias,?)>0",
@@ -146,23 +160,65 @@ def _damaged(connection: sqlite3.Connection) -> list[sqlite3.Row]:
 
 
 def _codes(connection: sqlite3.Connection, entity_id: int) -> list[str]:
-    return sorted({str(row[0]) for row in connection.execute(
+    """这个实体能关联到的番号：账本里挂的作品，加上它自己 metadata 记的番号。
+
+    只读 ``asset_entity`` 是不够的：这些损坏实体大多是当年「一条候选建一条实体」留下的，
+    有 70 条一条作品都没挂上，但它们建的时候是照某份快照建的，``metadata_json`` 里留着
+    ``content_id``／``provider_id``／``raw_snapshot``——那份快照往往还是好的。
+    """
+    codes = {str(row[0]) for row in connection.execute(
         "SELECT DISTINCT a.code FROM asset_entity ae JOIN asset a ON a.id=ae.asset_id"
-        " WHERE ae.entity_id=? AND a.code IS NOT NULL AND a.code<>''", (entity_id,))})
+        " WHERE ae.entity_id=? AND a.code IS NOT NULL AND a.code<>''", (entity_id,))}
+    codes |= _metadata_codes(connection, entity_id)
+    # `JUFE-493` 与元数据里的 `JUFE493` 是同一部作品：按归一化键去重，别当两条番号。
+    unique: dict[str, str] = {}
+    for code in sorted(codes):
+        unique.setdefault(_key(code), code)
+    return sorted(unique.values())
 
 
-def _evidence(index: dict[str, list[Path]], codes: list[str], kind: str) -> tuple[set[str], list[Path]]:
-    """挂在这些番号上的快照给出的名字，连同读过的那几份快照路径。"""
-    names: set[str] = set()
+def _metadata_codes(connection: sqlite3.Connection, entity_id: int) -> set[str]:
+    row = connection.execute(
+        "SELECT metadata_json FROM entity WHERE id=?", (entity_id,)).fetchone()
+    if row is None:
+        return set()
+    try:
+        metadata = json.loads(str(row[0] or "{}"))
+    except ValueError:
+        return set()
+    if not isinstance(metadata, dict):
+        return set()
+    codes = set()
+    for field in ("content_id", "provider_id"):
+        value = metadata.get(field)
+        if isinstance(value, str) and value.strip():
+            codes.add(value.strip())
+    snapshot = metadata.get("raw_snapshot")
+    if isinstance(snapshot, str) and snapshot.strip():
+        code, separator, _source = Path(snapshot).name.rpartition("-")
+        if separator and code:
+            codes.add(code)
+    return codes
+
+
+def _evidence(index: dict[str, list[Path]], codes: list[str], kind: str) -> tuple[dict[str, set[str]], list[Path]]:
+    """按番号分别取证：每个番号上的快照给出哪些名字，连同读过的那几份快照路径。
+
+    分开保留而不是并成一个集合，是因为同一个损坏名可能对应多个原名（见 ``collect``）：
+    要知道是哪个番号说的是谁，才能把作品分回各自的人。
+    """
+    per_code: dict[str, set[str]] = {}
     used: list[Path] = []
     for code in codes:
+        found: set[str] = set()
         for path in index.get(_key(code), ()):
             payload = _snapshot(path)
             if payload is None:
                 continue
             used.append(path)
-            names |= names_in(payload, kind)
-    return names, used
+            found |= names_in(payload, kind)
+        per_code[code] = found
+    return per_code, used
 
 
 def _global_names(index: dict[str, list[Path]], kinds: tuple[str, ...]) -> dict[str, set[str]]:
@@ -175,6 +231,22 @@ def _global_names(index: dict[str, list[Path]], kinds: tuple[str, ...]) -> dict[
                 continue
             for kind in kinds:
                 found[kind] |= names_in(payload, kind)
+    return found
+
+
+def _ledger_names(connection: sqlite3.Connection) -> dict[str, list[tuple[int, str]]]:
+    """账本里各条同类实体的干净规范名，连 id 一起。
+
+    来源快照自己在同一个编码错配窗口里被写坏时（快照里每个名字都带 U+FFFD），快照取证
+    就无从下手；但账本里别的实体还留着干净的名字。把它们的名字按同一条错配反向算一遍，
+    能对上损坏名的就是候选项——这是用账本给自己当字典。
+    """
+    found: dict[str, list[tuple[int, str]]] = {}
+    for row in connection.execute(
+        "SELECT id,kind,canonical_name FROM entity WHERE instr(canonical_name,?)<=0"
+        " ORDER BY kind,id", (DAMAGE,)
+    ):
+        found.setdefault(str(row[1]), []).append((int(row[0]), str(row[2])))
     return found
 
 
@@ -194,7 +266,8 @@ def collect(connection: sqlite3.Connection, snapshots: Path) -> list[dict[str, o
                          "reason": "unsupported-kind", "conflict_entity_id": ""})
             continue
         codes = _codes(connection, entity_id)
-        names, used = _evidence(index, codes, kind)
+        per_code, used = _evidence(index, codes, kind)
+        names = {name for found in per_code.values() for name in found}
         scope = "same-code"
         if not codes:
             # 没挂任何作品就没有同番号旁证，只能退到全库找唯一图像；这时的结论只够改名，
@@ -204,18 +277,37 @@ def collect(connection: sqlite3.Connection, snapshots: Path) -> list[dict[str, o
             names, used = global_names[kind], []
             scope = "global"
         candidates = {name for name in names if mangled(name) == current}
+        ledger = _ledger_names(connection).get(kind, [])
+        ledger_hits = [name for _id, name in ledger if mangled(name) == current]
         row: dict[str, object] = {
             "entity_id": entity_id, "kind": kind, "current": current, "target": "",
             "assets": connection.execute(
                 "SELECT count(*) FROM asset_entity WHERE entity_id=?", (entity_id,)).fetchone()[0],
             "codes": " ".join(codes), "snapshots": " | ".join(str(path) for path in used),
-            "action": SKIP, "reason": "", "conflict_entity_id": "",
+            "action": SKIP, "reason": "", "conflict_entity_id": "", "split_plan": "",
         }
         rows.append(row)
         if not candidates:
+            if len(ledger_hits) == 1:
+                # 快照自己也坏了，只能拿账本里别的干净实体当字典：唯一命中就是它，
+                # 而且那条实体本来就在，所以是合并过去而不是改名。
+                target = ledger_hits[0]
+                clash = _clash(connection, kind, entity_id, target)
+                if clash is not None:
+                    row["target"] = target
+                    row["action"], row["conflict_entity_id"] = MERGE, clash
+                    row["reason"] = "ledger-dictionary"
+                    continue
             row["reason"] = "no-codes-no-global-match" if not codes else "missing-evidence"
             continue
         if len(candidates) > 1:
+            plan = (_split_plan(connection, kind, entity_id, codes, per_code, current)
+                    if scope == "same-code" else None)
+            if plan is not None:
+                row["action"], row["reason"] = SPLIT, "one-name-many-people"
+                row["target"] = " | ".join(sorted(candidates))
+                row["split_plan"] = _format_split(plan)
+                continue
             row["target"] = " | ".join(sorted(candidates))
             row["reason"] = "ambiguous-evidence"
             continue
@@ -286,12 +378,136 @@ def _apply_merge(connection: sqlite3.Connection, row: dict, now: str, counts: Co
         connection, kind, target, old, str(kept[0]))
 
 
+def _split_plan(connection: sqlite3.Connection, kind: str, entity_id: int, codes: list[str],
+                per_code: dict[str, set[str]], current: str) -> list[tuple[str, str, int | None]] | None:
+    """一个损坏名对上多个原名时，按番号把作品分回各自的人。
+
+    GBK 是双字节、UTF-8 是变长：写出去再按 UTF-8 读回来，不同的原文可以塌成同一串
+    U+FFFD——`菊乃らん` 与 `弓乃りむ` 就是同一个损坏名。这不是名字写错，是两个人的作品
+    被并进了同一条实体，改名改不动它，只能拆。
+
+    每个番号必须各自指出**唯一**的人，且这个人不能就是没被拆开的那条；只要有一个番号
+    指不出人、或指到两处，整条都不拆——宁可留在复核里，也不能把作品挂到别人名下。
+    """
+    assignments: list[tuple[str, str, int | None]] = []
+    seen_names: set[str] = set()
+    for code in codes:
+        found = per_code.get(code) or set()
+        hit = {name for name in found if mangled(name) == current}
+        if len(hit) != 1:
+            return None
+        name = next(iter(hit))
+        owner = _occupant(connection, kind, name)
+        if owner == entity_id:
+            return None
+        if name in seen_names and owner is None:
+            # 同一个新名字要新建两次，说明取证本身没把它们分开。
+            return None
+        seen_names.add(name)
+        assignments.append((code, name, owner))
+    if len(seen_names) < 2:
+        return None
+    return assignments
+
+
+def _format_split(plan: list[tuple[str, str, int | None]]) -> str:
+    return "; ".join(f"{code}|{name}|{'' if owner is None else owner}" for code, name, owner in plan)
+
+
+def _parse_split(value: object) -> list[tuple[str, str, int | None]]:
+    plan: list[tuple[str, str, int | None]] = []
+    for chunk in str(value or "").split(";"):
+        parts = chunk.strip().split("|")
+        if len(parts) != 3 or not parts[0].strip() or not parts[1].strip():
+            continue
+        owner = parts[2].strip()
+        plan.append((parts[0].strip(), parts[1].strip(), int(owner) if owner else None))
+    return plan
+
+
+def _apply_split(connection: sqlite3.Connection, row: dict, now: str, counts: Counter) -> None:
+    """把每个番号上的作品改挂到它该属的人身上，再删掉这条串名实体。
+
+    目标人已存在就挂过去；不存在就当场建一条。全部挂完原实体若已无作品，直接删除——
+    它记的那个损坏名本来就不是任何人的名字。用 ``entity_redirect`` 留墓碑：万一还有链接
+    指着它，能指回正确的人。
+    """
+    entity_id, kind = int(row["entity_id"]), str(row["kind"])
+    old = str(row["current"])
+    plan = _parse_split(row.get("split_plan"))
+    if not plan:
+        counts["clash"] += 1
+        return
+    landed: list[int] = []
+    for code, name, _recorded in plan:
+        owner = _occupant(connection, kind, name)
+        if owner is None:
+            owner = _create_entity(connection, kind, name, now)
+            counts["created"] += 1
+        if owner == entity_id:
+            # 新名字落回这条串名实体自己，说明它根本没被拆开。
+            counts["clash"] += 1
+            return
+        assets = [int(item[0]) for item in connection.execute(
+            "SELECT DISTINCT ae.asset_id FROM asset_entity ae JOIN asset a ON a.id=ae.asset_id"
+            " WHERE ae.entity_id=? AND a.code=?", (entity_id, code))]
+        for asset_id in assets:
+            moved = connection.execute(
+                "UPDATE OR IGNORE asset_entity SET entity_id=? WHERE asset_id=? AND entity_id=?",
+                (owner, asset_id, entity_id)).rowcount
+            counts["assets"] += int(moved or 0)
+            # 扁平投影里那条 `演员:<损坏名>` 是照着这条串名实体写的，按资产逐条改成新名字。
+            counts["flat_rewritten"] += _retag(connection, asset_id, old, name)
+        landed.append(owner)
+    if not landed:
+        counts["clash"] += 1
+        return
+    counts["split"] += 1
+    counts["aliases_dropped"] += _dropped_aliases(connection, entity_id)
+    left = connection.execute(
+        "SELECT count(*) FROM asset_entity WHERE entity_id=?", (entity_id,)).fetchone()[0]
+    if left:
+        # 还有作品没分出去（不该发生，但别把证据一起删掉）：只改名，等人工看。
+        kept = connection.execute(
+            "SELECT canonical_name FROM entity WHERE id=?", (landed[0],)).fetchone()
+        if kept is not None:
+            connection.execute(
+                "UPDATE entity SET canonical_name=?,normalized_name=?,updated_at=? WHERE id=?",
+                (str(kept[0]), normalize_entity_name(str(kept[0])), now, entity_id))
+            counts["flat_rewritten"] += rewrite_flat_projection(
+                connection, kind, entity_id, old, str(kept[0]))
+        return
+    connection.execute(
+        "INSERT OR IGNORE INTO entity_redirect(old_id,target_id,source,merged_at) VALUES(?,?,?,?)",
+        (entity_id, landed[0], SPLIT_SOURCE, now))
+    connection.execute("DELETE FROM entity WHERE id=?", (entity_id,))
+    counts["deleted"] += int(connection.execute("SELECT changes()").fetchone()[0])
+
+
+def _create_entity(connection: sqlite3.Connection, kind: str, name: str, now: str) -> int:
+    cursor = connection.execute(
+        "INSERT INTO entity(kind,canonical_name,normalized_name,metadata_json,created_at,updated_at)"
+        " VALUES(?,?,?,'{}',?,?)",
+        (kind, name, normalize_entity_name(name), now, now))
+    return int(cursor.lastrowid)
+
+
+def _retag(connection: sqlite3.Connection, asset_id: int, old: str, new: str) -> int:
+    old_tag, new_tag = f"演员:{old}", f"演员:{new}"
+    connection.execute(
+        "INSERT OR IGNORE INTO asset_tag(asset_id,tag,confidence,source) "
+        "SELECT asset_id,?,confidence,source FROM asset_tag WHERE asset_id=? AND tag=?",
+        (new_tag, asset_id, old_tag))
+    connection.execute("DELETE FROM asset_tag WHERE asset_id=? AND tag=?", (asset_id, old_tag))
+    return int(connection.execute("SELECT changes()").fetchone()[0])
+
+
 def apply_rows(connection: sqlite3.Connection, rows: list[dict[str, object]], now: str) -> Counter:
-    """按计划改名与合并。现名已变的整行跳过，冲突的只计数不硬改。"""
+    """按计划改名、合并、拆分。现名已变的整行跳过，冲突的只计数不硬改。"""
     counts: Counter = Counter()
     for row in rows:
         action = str(row["action"])
-        if action not in (RENAME, MERGE):
+        if action not in (RENAME, MERGE, SPLIT):
             continue
         entity_id, kind = int(row["entity_id"]), str(row["kind"])
         found = connection.execute(
@@ -301,6 +517,8 @@ def apply_rows(connection: sqlite3.Connection, rows: list[dict[str, object]], no
             continue
         if action == RENAME:
             _apply_rename(connection, row, now, counts)
-        else:
+        elif action == MERGE:
             _apply_merge(connection, row, now, counts)
+        else:
+            _apply_split(connection, row, now, counts)
     return counts
