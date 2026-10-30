@@ -90,6 +90,7 @@ SCOPES: dict[str, tuple[str, ...]] = {
                  "test_avatar_watermark.py", "test_avatar_picker.py",
                  "test_portrait_gaps.py", "test_portrait_artwork.py",
                  "test_r18_machine_translation_repair.py",
+                 "test_garbled_entity_name_repair.py",
                  "test_social_avatar_harvest.py",
                  "test_series_localization.py",
                  "test_duplicate_identity_merge.py", "test_entity_merge.py", "test_entity_redirect.py",
@@ -320,6 +321,7 @@ AUTO_SCOPE_PREFIXES: tuple[tuple[str, str | tuple[str, ...]], ...] = (
     ("scripts/fetch_studio_avatar_candidates.py", ("metadata", "tooling")),
     ("scripts/scrape_codes.py", ("metadata", "tooling")),
     ("scripts/repair_r18_machine_translations.py", ("metadata", "tooling")),
+    ("scripts/repair_garbled_entity_names.py", ("metadata", "tooling")),
     ("scripts/merge_studio_name_variants.py", ("metadata", "tooling")),
     ("scripts/harvest_", ("metadata", "tooling")),
     # amane 桥（ADR-0043）：脚本由 metadata 域的单测装载，清单与锁由 checks 域的依赖策略核。

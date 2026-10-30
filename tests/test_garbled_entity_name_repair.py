@@ -1,0 +1,249 @@
+"""解码错配写坏的规范名修复：判据必须逐字节成立，证据必须来自同一番号。
+
+这里守的是「什么才算证据」。三条退让都会把别人的名字改错：靠相似度猜、拿全库对像
+代替同番号、把撞名直接当同一人。
+"""
+import json
+import sqlite3
+import tempfile
+import unittest
+from pathlib import Path
+
+from peach import garbled_name_repair as module
+from peach.migrations import upgrade
+
+ROOT = Path(__file__).resolve().parents[1]
+
+#: 这串日文按 GBK 编码再按 UTF-8 读回来就是下面那个损坏名。判据的整个立足点。
+CLEAN = "夏目彩春"
+DAMAGED = CLEAN.encode("gbk").decode("utf-8", errors="replace")
+
+
+class Fixture(unittest.TestCase):
+    """临时账本与快照目录；用例用它铺一条实体、它的作品和作品快照。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.db = root / "ledger.db"
+        self.snapshots = root / "snapshots"
+        self.snapshots.mkdir()
+        upgrade(self.db, ROOT / "migrations")
+        self.con = sqlite3.connect(self.db)
+        self.con.row_factory = sqlite3.Row
+        self.con.execute("PRAGMA foreign_keys=ON")
+
+    def tearDown(self):
+        self.con.close()
+        self.tmp.cleanup()
+
+    def entity(self, entity_id: int, kind: str, name: str) -> int:
+        self.con.execute(
+            "INSERT INTO entity(id,kind,canonical_name,normalized_name,created_at,updated_at)"
+            " VALUES(?,?,?,?,'2026-10-26T00:00:00Z','2026-10-26T00:00:00Z')",
+            (entity_id, kind, name, module.normalize_entity_name(name)))
+        return entity_id
+
+    def asset(self, asset_id: int, code: str) -> int:
+        self.con.execute(
+            "INSERT INTO asset(id,location,path,name,medium,code) VALUES(?,?,?,?,'video',?)",
+            (asset_id, "local", f"{asset_id}.mp4", f"{asset_id}.mp4", code))
+        return asset_id
+
+    def link(self, asset_id: int, entity_id: int, kind: str) -> None:
+        self.con.execute(
+            "INSERT OR IGNORE INTO asset_entity(asset_id,entity_id,role,source)"
+            " VALUES(?,?,?,'javinizer:current')", (asset_id, entity_id, kind))
+
+    def snapshot(self, code: str, source: str, **payload) -> Path:
+        path = self.snapshots / f"{code}-{source}.json"
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        return path
+
+    def performer_snapshot(self, code: str, *names: str, source: str = "javdb") -> Path:
+        return self.snapshot(code, source, actresses=[
+            {"japanese_name": name} for name in names])
+
+    def rows(self) -> dict[int, dict]:
+        return {int(row["entity_id"]): row for row in module.collect(self.con, self.snapshots)}
+
+
+class MangledTests(unittest.TestCase):
+    def test_the_mapping_reproduces_the_damaged_name_byte_for_byte(self):
+        self.assertEqual(module.mangled(CLEAN), DAMAGED)
+
+    def test_a_name_that_cannot_travel_that_channel_maps_to_nothing(self):
+        """emoji 与生僻字编不进 GBK：它不可能是账本里那个损坏名的来源。"""
+        self.assertIsNone(module.mangled("😀"))
+        self.assertIsNone(module.mangled("𠮷野家"))
+
+    def test_a_clean_ascii_name_is_its_own_image(self):
+        self.assertEqual(module.mangled("MOODYZ"), "MOODYZ")
+
+
+class CollectTests(Fixture):
+    def test_a_unique_name_on_the_same_code_is_renamed(self):
+        self.entity(1, "performer", DAMAGED)
+        self.asset(10, "MIDE-044")
+        self.link(10, 1, "performer")
+        self.performer_snapshot("MIDE-044", CLEAN)
+        row = self.rows()[1]
+        self.assertEqual((row["action"], row["target"], row["reason"]),
+                         ("rename", CLEAN, "verified-same-code"))
+
+    def test_a_snapshot_of_another_code_is_not_evidence(self):
+        """同一个名字出现在别的番号上，说明不了这条实体是谁。"""
+        self.entity(1, "performer", DAMAGED)
+        self.asset(10, "MIDE-044")
+        self.link(10, 1, "performer")
+        self.performer_snapshot("MIDE-999", CLEAN)
+        row = self.rows()[1]
+        self.assertEqual((row["action"], row["reason"]), ("skip", "missing-evidence"))
+
+    def test_an_orphan_falls_back_to_a_unique_global_match(self):
+        self.entity(1, "series", "朝を迎えても".encode("gbk").decode("utf-8", errors="replace"))
+        self.snapshot("ABC-001", "makers", series="朝を迎えても")
+        row = self.rows()[1]
+        self.assertEqual((row["action"], row["reason"]), ("rename", "verified-global"))
+
+    def test_an_orphan_with_two_global_matches_is_left_alone(self):
+        """`輪●計画` 与 `輪姦計画` 折成同一个损坏名：这是这条路唯一不能自动的地方。"""
+        damaged = "輪姦計画".encode("gbk").decode("utf-8", errors="replace")
+        self.entity(1, "series", damaged)
+        self.snapshot("ABC-001", "makers", series="輪姦計画")
+        self.snapshot("ABC-002", "makers", series="輪●計画")
+        row = self.rows()[1]
+        self.assertEqual((row["action"], row["reason"]), ("skip", "ambiguous-evidence"))
+        self.assertIn("輪●計画", row["target"])
+
+    def test_a_damaged_name_in_the_snapshot_is_not_evidence(self):
+        self.entity(1, "performer", DAMAGED)
+        self.asset(10, "MIDE-044")
+        self.link(10, 1, "performer")
+        self.performer_snapshot("MIDE-044", CLEAN.replace("彩", "\ufffd"))
+        self.assertEqual(self.rows()[1]["reason"], "missing-evidence")
+
+    def test_the_same_code_seen_from_two_sources_is_still_one_answer(self):
+        self.entity(1, "performer", DAMAGED)
+        self.asset(10, "MIDE-044")
+        self.link(10, 1, "performer")
+        self.performer_snapshot("MIDE-044", CLEAN, source="javdb")
+        self.performer_snapshot("MIDE-044", CLEAN, source="r18dev")
+        self.assertEqual(self.rows()[1]["action"], "rename")
+
+    def test_a_javinizer_snapshot_wrapped_in_result_is_read(self):
+        self.entity(1, "performer", DAMAGED)
+        self.asset(10, "MIDE-044")
+        self.link(10, 1, "performer")
+        self.snapshot("MIDE-044", "javinizer",
+                      result={"actresses": [{"name": CLEAN}]})
+        self.assertEqual(self.rows()[1]["target"], CLEAN)
+
+    def test_studio_names_are_plain_strings_in_the_snapshot(self):
+        """厂牌名在快照里是字符串，女优名才是对象列表。当列表读会一个都取不到。"""
+        damaged = "ダスッ！".encode("gbk").decode("utf-8", errors="replace")
+        self.entity(1, "studio", damaged)
+        self.asset(10, "DASD-866")
+        self.link(10, 1, "studio")
+        self.snapshot("DASD-866", "makers", maker="ダスッ！")
+        self.assertEqual(self.rows()[1]["action"], "rename")
+
+    def test_an_unsupported_kind_is_reported_not_guessed(self):
+        self.entity(1, "tag", DAMAGED)
+        row = self.rows()[1]
+        self.assertEqual((row["action"], row["reason"]), ("skip", "unsupported-kind"))
+
+
+class MergeTests(Fixture):
+    def setUp(self):
+        super().setUp()
+        # 同一个人：重采时新建的干净实体接管了作品，旧的损坏实体留在原地。
+        self.entity(1, "performer", DAMAGED)
+        self.entity(2, "performer", CLEAN)
+        self.asset(10, "MIDE-044")
+        self.link(10, 1, "performer")
+        self.performer_snapshot("MIDE-044", CLEAN)
+
+    def test_a_name_taken_by_a_same_code_entity_becomes_a_merge(self):
+        row = self.rows()[1]
+        self.assertEqual((row["action"], int(row["conflict_entity_id"])),
+                         ("merge", 2))
+
+    def test_the_damaged_entity_disappears_and_its_assets_move(self):
+        with self.con:
+            counts = module.apply_rows(self.con, module.collect(self.con, self.snapshots),
+                                      "2026-10-30T00:00:00Z")
+        self.assertEqual(counts["merged"], 1)
+        self.assertEqual(self.con.execute(
+            "SELECT count(*) FROM entity WHERE id=1").fetchone()[0], 0)
+        self.assertEqual(self.con.execute(
+            "SELECT entity_id FROM asset_entity WHERE asset_id=10").fetchone()[0], 2)
+
+    def test_the_damaged_name_is_not_kept_as_an_alias(self):
+        """损坏名不是任何来源写过的原文：留着它只污染检索。"""
+        with self.con:
+            module.apply_rows(self.con, module.collect(self.con, self.snapshots),
+                              "2026-10-30T00:00:00Z")
+        aliases = [row[0] for row in self.con.execute("SELECT alias FROM entity_alias")]
+        self.assertFalse([alias for alias in aliases if module.DAMAGE in alias])
+
+    def test_the_tombstone_points_at_the_surviving_entity(self):
+        with self.con:
+            module.apply_rows(self.con, module.collect(self.con, self.snapshots),
+                              "2026-10-30T00:00:00Z")
+        self.assertEqual(self.con.execute(
+            "SELECT target_id FROM entity_redirect WHERE old_id=1").fetchone()[0], 2)
+
+
+class RenameTests(Fixture):
+    def setUp(self):
+        super().setUp()
+        self.entity(1, "performer", DAMAGED)
+        self.asset(10, "MIDE-044")
+        self.link(10, 1, "performer")
+        self.performer_snapshot("MIDE-044", CLEAN)
+
+    def apply(self):
+        with self.con:
+            return module.apply_rows(self.con, module.collect(self.con, self.snapshots),
+                                     "2026-10-30T00:00:00Z")
+
+    def test_the_canonical_and_normalized_name_both_change(self):
+        self.assertEqual(self.apply()["renamed"], 1)
+        row = self.con.execute(
+            "SELECT canonical_name,normalized_name FROM entity WHERE id=1").fetchone()
+        self.assertEqual(tuple(row), (CLEAN, module.normalize_entity_name(CLEAN)))
+
+    def test_the_flat_projection_follows(self):
+        """只改实体不改 `演员:` 标签，卡片上还写着旧名、按旧名也照样查得到。"""
+        self.con.execute(
+            "INSERT INTO asset_tag(asset_id,tag,confidence,source) VALUES(10,?,0.9,'auto:javdb')",
+            (f"演员:{DAMAGED}",))
+        self.assertEqual(self.apply()["flat_rewritten"], 1)
+        tags = [row[0] for row in self.con.execute("SELECT tag FROM asset_tag")]
+        self.assertEqual(tags, [f"演员:{CLEAN}"])
+
+    def test_a_row_whose_current_name_moved_on_is_skipped(self):
+        """`collect` 到写入之间账本可能已经变过；按计划硬改就是改错了人。"""
+        rows = module.collect(self.con, self.snapshots)
+        with self.con:
+            self.con.execute("UPDATE entity SET canonical_name='别人' WHERE id=1")
+        with self.con:
+            counts = module.apply_rows(self.con, rows, "2026-10-30T00:00:00Z")
+        self.assertEqual(counts["stale"], 1)
+        self.assertEqual(self.con.execute(
+            "SELECT canonical_name FROM entity WHERE id=1").fetchone()[0], "别人")
+
+    def test_a_row_that_became_a_clash_is_not_written(self):
+        rows = module.collect(self.con, self.snapshots)
+        with self.con:
+            self.entity(9, "performer", CLEAN)
+        with self.con:
+            counts = module.apply_rows(self.con, rows, "2026-10-30T00:00:00Z")
+        self.assertEqual(counts["clash"], 1)
+        self.assertEqual(self.con.execute(
+            "SELECT canonical_name FROM entity WHERE id=1").fetchone()[0], DAMAGED)
+
+
+if __name__ == "__main__":
+    unittest.main()
