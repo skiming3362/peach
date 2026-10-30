@@ -201,6 +201,75 @@ def _metadata_codes(connection: sqlite3.Connection, entity_id: int) -> set[str]:
     return codes
 
 
+def _code_index(connection: sqlite3.Connection,
+                kind: str) -> dict[str, list[tuple[int, str]]]:
+    """同一种类里，每部挂着作品（番号）的干净实体：番号键 -> [(实体 id, 规范名)]。
+
+    重采一部作品会写出两条实体：旧的留着坏名字，新的已经有干净名字。两条说的是同一部
+    作品，也就说的是同一个厂牌或同一个系列——「同番号同实体」，不需要名字能反算回来。
+    一次建好按种类复用，避免逐条损坏实体重复扫描。
+    """
+    found: dict[str, list[tuple[int, str]]] = {}
+    for row in connection.execute(
+        "SELECT id,canonical_name FROM entity WHERE kind=? AND instr(canonical_name,?)<=0"
+        " ORDER BY id", (kind, DAMAGE)
+    ):
+        entity_id, name = int(row[0]), str(row[1])
+        for code in _codes(connection, entity_id):
+            found.setdefault(_key(code), []).append((entity_id, name))
+    return found
+
+
+def _provider(connection: sqlite3.Connection, entity_id: int) -> str:
+    row = connection.execute(
+        "SELECT metadata_json FROM entity WHERE id=?", (entity_id,)).fetchone()
+    if row is None:
+        return ""
+    try:
+        metadata = json.loads(str(row[0] or "{}"))
+    except ValueError:
+        return ""
+    provider = metadata.get("provider") if isinstance(metadata, dict) else None
+    return provider.strip() if isinstance(provider, str) else ""
+
+
+def _pick_sibling(connection: sqlite3.Connection, entity_id: int,
+                  shared: dict[int, list]) -> tuple[int, str] | None:
+    """从同番号的干净实体里挑出唯一的那条；挑不出来就返回 None。
+
+    同一部作品可能被两条来源写成两条实体（makers 的未打码原名、r18dev 的打码写法）。
+    先按来源链筛：重采会沿与原先同一条链路写出实体，所以 provider 相同的那条才是它；
+    筛完仍不唯一就交给人工，不做猜测。
+    """
+    if len(shared) == 1:
+        other = next(iter(shared))
+        return other, shared[other][0]
+    provider = _provider(connection, entity_id)
+    if provider:
+        same = [other for other in shared if _provider(connection, other) == provider]
+        if len(same) == 1:
+            return same[0], shared[same[0]][0]
+    return None
+
+
+def _pick_candidate(connection: sqlite3.Connection, kind: str, entity_id: int,
+                    candidates: set[str]) -> tuple[str, int] | None:
+    """多个候选名里挑出唯一的那条实体；挑不出来就交给人工。
+
+    同一部作品在 makers 与 r18dev 上会写成两个名字（原名与打码写法），两条实体各占一个。
+    重采会沿与原先同一条来源链写出实体，所以 provider 相符的那个才是它。
+    """
+    provider = _provider(connection, entity_id)
+    if not provider:
+        return None
+    matched = []
+    for name in candidates:
+        owner = _occupant(connection, kind, name)
+        if owner is not None and _provider(connection, owner) == provider:
+            matched.append((name, owner))
+    return matched[0] if len(matched) == 1 else None
+
+
 def _evidence(index: dict[str, list[Path]], codes: list[str], kind: str) -> tuple[dict[str, set[str]], list[Path]]:
     """按番号分别取证：每个番号上的快照给出哪些名字，连同读过的那几份快照路径。
 
@@ -250,11 +319,53 @@ def _ledger_names(connection: sqlite3.Connection) -> dict[str, list[tuple[int, s
     return found
 
 
+def _resolve_without_candidate(connection: sqlite3.Connection, row: dict, codes: list[str],
+                               ledger_hits: list[str],
+                               siblings: dict[str, dict[str, list[tuple[int, str]]]]) -> None:
+    """名字反算不出候选时，退到账本自身当证据：只有这些旁证，不留就是留在复核里。
+
+    两种旁证：一是账本里另有干净实体的名字正好反算成这样；二是账本里另有干净实体挂着
+    同一部作品。两条都要求唯一命中，多一条就说明取不到证，不做猜测。
+    """
+    entity_id, kind = int(row["entity_id"]), str(row["kind"])
+    if len(ledger_hits) == 1:
+        # 快照自己也坏了，只能拿账本里别的干净实体当字典：唯一命中就是它，
+        # 而且那条实体本来就在，所以是合并过去而不是改名。
+        target = ledger_hits[0]
+        clash = _clash(connection, kind, entity_id, target)
+        if clash is not None:
+            row["target"] = target
+            row["action"], row["conflict_entity_id"] = MERGE, clash
+            row["reason"] = "ledger-dictionary"
+            return
+    if kind not in siblings:
+        siblings[kind] = _code_index(connection, kind)
+    shared: dict[int, list] = {}
+    for code in codes:
+        for other, name in siblings[kind].get(_key(code), ()):
+            if other != entity_id:
+                shared.setdefault(other, [name, 0])[1] += 1
+    chosen = _pick_sibling(connection, entity_id, shared)
+    if chosen is not None:
+        # 名字反算不出来，但账本里只有一条干净实体挂着这部作品：同一部作品只有
+        # 一个厂牌或一个系列，所以那条就是它，合并过去。
+        other, name = chosen
+        row["target"] = name
+        row["action"], row["conflict_entity_id"] = MERGE, other
+        row["reason"] = "same-code-clean-sibling"
+        return
+    row["target"] = " | ".join(sorted(name for name, _count in shared.values()))
+    row["reason"] = "ambiguous-sibling" if shared else (
+        "no-codes-no-global-match" if not codes else "missing-evidence")
+
+
 def collect(connection: sqlite3.Connection, snapshots: Path) -> list[dict[str, object]]:
     """逐条判定损坏的规范名怎么处置：改名、合并，或留给人。"""
     connection.row_factory = sqlite3.Row
     index = snapshot_index(snapshots)
     global_names: dict[str, set[str]] = {}
+    ledger = _ledger_names(connection)
+    siblings: dict[str, dict[str, list[tuple[int, str]]]] = {}
     rows: list[dict[str, object]] = []
     for entity in _damaged(connection):
         entity_id, kind = int(entity["id"]), str(entity["kind"])
@@ -277,8 +388,7 @@ def collect(connection: sqlite3.Connection, snapshots: Path) -> list[dict[str, o
             names, used = global_names[kind], []
             scope = "global"
         candidates = {name for name in names if mangled(name) == current}
-        ledger = _ledger_names(connection).get(kind, [])
-        ledger_hits = [name for _id, name in ledger if mangled(name) == current]
+        ledger_hits = [name for _id, name in ledger.get(kind, []) if mangled(name) == current]
         row: dict[str, object] = {
             "entity_id": entity_id, "kind": kind, "current": current, "target": "",
             "assets": connection.execute(
@@ -288,17 +398,7 @@ def collect(connection: sqlite3.Connection, snapshots: Path) -> list[dict[str, o
         }
         rows.append(row)
         if not candidates:
-            if len(ledger_hits) == 1:
-                # 快照自己也坏了，只能拿账本里别的干净实体当字典：唯一命中就是它，
-                # 而且那条实体本来就在，所以是合并过去而不是改名。
-                target = ledger_hits[0]
-                clash = _clash(connection, kind, entity_id, target)
-                if clash is not None:
-                    row["target"] = target
-                    row["action"], row["conflict_entity_id"] = MERGE, clash
-                    row["reason"] = "ledger-dictionary"
-                    continue
-            row["reason"] = "no-codes-no-global-match" if not codes else "missing-evidence"
+            _resolve_without_candidate(connection, row, codes, ledger_hits, siblings)
             continue
         if len(candidates) > 1:
             plan = (_split_plan(connection, kind, entity_id, codes, per_code, current)
@@ -307,6 +407,15 @@ def collect(connection: sqlite3.Connection, snapshots: Path) -> list[dict[str, o
                 row["action"], row["reason"] = SPLIT, "one-name-many-people"
                 row["target"] = " | ".join(sorted(candidates))
                 row["split_plan"] = _format_split(plan)
+                continue
+            picked = _pick_candidate(connection, kind, entity_id, candidates)
+            if picked is not None:
+                # 两个候选名其实是同一部作品的两条实体：makers 的未打码原名和 r18dev 的
+                # 打码写法。重采沿原链路写，所以 provider 相同的那个才是它。
+                target, owner = picked
+                row["target"] = target
+                row["action"], row["conflict_entity_id"] = MERGE, owner
+                row["reason"] = "same-code-credits-target"
                 continue
             row["target"] = " | ".join(sorted(candidates))
             row["reason"] = "ambiguous-evidence"

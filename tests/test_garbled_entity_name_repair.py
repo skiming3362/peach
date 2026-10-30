@@ -357,5 +357,79 @@ class MetadataCodeTests(Fixture):
         self.assertEqual(rows[1]["conflict_entity_id"], 2)
 
 
+class SiblingTests(Fixture):
+    """重采同一部作品会写出两条实体：旧的留着坏名字，新的已经有干净名字。"""
+
+    def setUp(self):
+        super().setUp()
+        self.entity(1, "series", "FETISH" + module.DAMAGE * 2 + "BODY")
+        self.asset(10, "MIAD-495")
+        self.link(10, 1, "series")
+        self.snapshot("MIAD-495", "makers", series="FETISH" + module.DAMAGE * 2 + "BODY")
+
+    def provider(self, entity_id: int, provider: str) -> None:
+        """记下这条实体的来源链；和它原有的番号并存，不覆盖。"""
+        row = self.con.execute("SELECT metadata_json FROM entity WHERE id=?",
+                               (entity_id,)).fetchone()
+        metadata = json.loads(row[0] or "{}")
+        metadata["provider"] = provider
+        self.con.execute("UPDATE entity SET metadata_json=? WHERE id=?",
+                         (json.dumps(metadata), entity_id))
+
+    def clean(self, entity_id: int, name: str, code: str = "MIAD-495") -> None:
+        """同一部作品上另一条名字干净的实体：它建的时候记着这部作品的番号。"""
+        self.entity(entity_id, "series", name)
+        self.con.execute("UPDATE entity SET metadata_json=? WHERE id=?",
+                         (json.dumps({"content_id": code}), entity_id))
+
+    def test_a_clean_entity_on_the_same_code_is_merged_into(self):
+        """名字反算不出来（`FETISH BODY` 编回去不是那个坏串），但同番号的干净实体只有一个。"""
+        self.clean(2, "FETISH BODY")
+        rows = self.rows()
+        self.assertEqual(rows[1]["action"], module.MERGE)
+        self.assertEqual(rows[1]["reason"], "same-code-clean-sibling")
+        self.assertEqual(rows[1]["target"], "FETISH BODY")
+        self.assertEqual(rows[1]["conflict_entity_id"], 2)
+
+    def test_two_clean_entities_on_the_same_code_are_resolved_by_source(self):
+        """makers 的未打码原名与 r18dev 的打码写法各占一条实体，按来源链认自己那条。"""
+        self.clean(2, "輪●計画")
+        self.clean(3, "輪姦計画")
+        self.provider(1, "amane-makers")
+        self.provider(2, "javinizer-go")
+        self.provider(3, "amane-makers")
+        rows = self.rows()
+        self.assertEqual(rows[1]["action"], module.MERGE)
+        self.assertEqual(rows[1]["reason"], "same-code-clean-sibling")
+        self.assertEqual(rows[1]["conflict_entity_id"], 3)
+
+    def test_two_clean_entities_from_the_same_source_are_left_alone(self):
+        self.clean(2, "輪●計画")
+        self.clean(3, "輪姦計画")
+        self.provider(1, "amane-makers")
+        self.provider(2, "amane-makers")
+        self.provider(3, "amane-makers")
+        rows = self.rows()
+        self.assertEqual(rows[1]["action"], module.SKIP)
+        self.assertEqual(rows[1]["reason"], "ambiguous-sibling")
+
+    def test_a_clean_entity_that_already_moved_on_is_still_the_one(self):
+        """那条实体改过名，但它还挂着这部作品：合并过去，投影跟保留方的现名。"""
+        self.clean(2, "FETISH BODY")
+        self.con.execute("UPDATE entity SET canonical_name='別名',normalized_name='別名'"
+                         " WHERE id=2")
+        rows = self.rows()
+        self.assertEqual(rows[1]["action"], module.MERGE)
+        self.assertEqual(rows[1]["reason"], "same-code-clean-sibling")
+        self.assertEqual(rows[1]["conflict_entity_id"], 2)
+        self.assertEqual(rows[1]["target"], "別名")
+
+    def test_a_clean_entity_without_that_code_is_not_evidence(self):
+        self.clean(2, "FETISH BODY", code="OTHER-001")
+        rows = self.rows()
+        self.assertEqual(rows[1]["action"], module.SKIP)
+        self.assertEqual(rows[1]["reason"], "missing-evidence")
+
+
 if __name__ == "__main__":
     unittest.main()
