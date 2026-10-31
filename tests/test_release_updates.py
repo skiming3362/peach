@@ -16,8 +16,8 @@ def release(version, **extra):
 
 
 class ReleaseUpdateTests(unittest.TestCase):
-    def check(self, rows, status=200, version="0.9.0"):
-        transport = Mock(return_value=HttpResponse(status, {}, json.dumps(rows).encode()))
+    def check(self, rows, status=200, version="0.9.0", headers=None):
+        transport = Mock(return_value=HttpResponse(status, headers or {}, json.dumps(rows).encode()))
         with patch.object(release_updates, "__version__", version):
             return release_updates.check(transport=transport)
 
@@ -89,6 +89,16 @@ class ReleaseUpdateTests(unittest.TestCase):
             result = release_updates.check(transport=Mock(side_effect=cause))
             self.assertEqual(result["state"], "error")
             self.assertIsNone(result["latest_version"])
+
+    def test_a_refusal_says_what_went_wrong_instead_of_just_please_retry(self):
+        """配额用尽和网络故障都要落到同一句「请重试」时，人看不出该等还是该改代理。"""
+        exhausted = self.check({}, status=403, headers={"x-ratelimit-remaining": "0"})
+        self.assertEqual(exhausted["state"], "error")
+        self.assertIn("配额", exhausted["message"])
+        missing = self.check({}, status=404)
+        self.assertIn(release_updates.REPOSITORY, missing["message"])
+        other = self.check({}, status=502)
+        self.assertIn("502", other["message"])
 
     def test_the_only_source_reports_current_and_ahead(self):
         for version, state in (("0.46.1", "ahead"), ("0.48.2", "current")):

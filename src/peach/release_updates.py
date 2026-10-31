@@ -67,6 +67,14 @@ def _release_candidates(rows: list) -> list[tuple]:
     return releases
 
 
+def _failure(response) -> str:
+    """把非 200 的响应说清楚，别让限流和网络故障共用一个「请重试」。"""
+    if response.status == 403 and response.headers.get("x-ratelimit-remaining") == "0":
+        # 匿名配额按出口 IP 计，代理后面常常是很多人共用一个。
+        return "GitHub 接口的匿名配额已用完，请稍后重试或配置代理。"
+    if response.status == 404:
+        return f"找不到 {REPOSITORY} 的发布页。"
+    return f"未能取得版本信息（HTTP {response.status}），请重试。"
 def check(*, transport=None) -> dict:
     result = snapshot()
     client = transport or HttpxTransport()
@@ -76,8 +84,9 @@ def check(*, transport=None) -> dict:
         rows = json.loads(response.body) if response.status == 200 else None
         releases = _release_candidates(rows) if isinstance(rows, list) else []
         if not releases:
-            return dict(result, state="empty" if isinstance(rows, list) else "error",
-                        message="暂未找到可下载的测试版。" if isinstance(rows, list) else "未能取得版本信息，请重试。")
+            if isinstance(rows, list):
+                return dict(result, state="empty", message="暂未找到可下载的测试版。")
+            return dict(result, state="error", message=_failure(response))
         version, tag, asset, full, directory, release_url = max(releases, key=lambda item: item[0])
         current = _version(result["current_version"])
         if current is None:
