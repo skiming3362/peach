@@ -11,6 +11,27 @@ from filelock import FileLock, Timeout
 from . import distribution, release_updates, standalone_update
 from .fsutil import atomic_write_text
 
+#: 检查没拿到确定答案时，隔多久再试。按完整间隔记下来等于这一轮之内都不再重试，
+#: 而匿名接口的配额是按小时重置的，等满 24 小时太亏；跟着 60 秒一次的调度去撞又
+#: 会把每小时 60 次额度撞光，所以折中成十几分钟。
+RETRY_SECONDS = 15 * 60
+
+
+def _due(data: dict, now: float) -> bool:
+    """该不该真去查一遍。
+
+    退避时刻优先：上次失败后到点前一律不查，否则 60 秒一次的调度会把每小时 60 次的匿名
+    额度撞光。退避过后，间隔到了就查；间隔没到但上次是失败，也提前重试一次——失败的检查
+    不该让人干等一整个间隔。
+    """
+    retry = data.get("retry_at", 0)
+    if isinstance(retry, (int, float)) and now < retry:
+        return False
+    last = data.get("checked_at", 0)
+    if not isinstance(last, (int, float)) or now - last >= data["interval_hours"] * 3600:
+        return True
+    return isinstance(data.get("result"), dict) and data["result"].get("state") == "error"
+
 
 class AutomaticUpdates:
     def __init__(self, root: Path, *, available: bool):
@@ -81,14 +102,18 @@ class AutomaticUpdates:
                 if data["mode"] == "off":
                     return
                 now = time.time()
-                last = data.get("checked_at", 0)
-                if isinstance(last, (int, float)) and 0 <= now - last < data["interval_hours"] * 3600:
+                if not _due(data, now):
                     return
-                # 先落检查时间；进程中断后也按频率重试，多服务共用这一份记录。
+                # 先记检查时间：进程中断后也按频率重试，多服务共用这一份记录。
                 self.write(dict(data, checked_at=now))
                 result = release_updates.check()
                 data.pop("error", None)
                 data = dict(data, checked_at=now, result=result)
+                if result["state"] == "error":
+                    # 失败不算查过：记下重试时刻，到点前不再查，免得每 60 秒撞一次额度。
+                    data = dict(data, retry_at=now + RETRY_SECONDS)
+                else:
+                    data.pop("retry_at", None)
                 self.write(data)
                 if data["mode"] == "download" and distribution.standalone() and result["state"] == "available":
                     job = standalone_update.public()

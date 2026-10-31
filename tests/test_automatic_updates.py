@@ -48,6 +48,24 @@ class AutomaticUpdateTests(unittest.TestCase):
             check.assert_called_once()
         self.assertEqual(self.updates.read()["result"]["state"], "error")
 
+    def test_a_failed_check_retries_soon_instead_of_waiting_out_the_interval(self):
+        """按小时计的额度会被限流，可失败的检查也不该让人等满 24 小时才重试。"""
+        from peach.automatic_updates import RETRY_SECONDS
+        self.updates.save({"mode": "check", "interval_hours": 24})
+        with patch("peach.release_updates.check", return_value={"state": "error"}) as check, patch(
+                "peach.automatic_updates.time.time", return_value=100000):
+            self.updates.tick()
+            self.assertEqual(check.call_count, 1)
+        with patch("peach.release_updates.check", return_value={"state": "error"}) as check, patch(
+                "peach.automatic_updates.time.time", return_value=100000 + RETRY_SECONDS - 1):
+            self.updates.tick()
+            check.assert_not_called()
+        with patch("peach.release_updates.check", return_value={"state": "current"}) as check, patch(
+                "peach.automatic_updates.time.time", return_value=100000 + RETRY_SECONDS):
+            self.updates.tick()
+            check.assert_called_once()
+        self.assertNotIn("retry_at", self.updates.read(), "查成功之后不该再压着退避")
+
     def test_download_prepares_once_and_never_requests_restart(self):
         with patch("peach.distribution.standalone", return_value=True), patch(
                 "peach.release_updates.check", return_value={"state": "available"}), patch(
