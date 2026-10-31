@@ -293,6 +293,37 @@ class TestPlanningTests(unittest.TestCase):
         costs = [row['estimated_seconds'] for row in matrix]
         self.assertLess(max(costs) - min(costs), 60)
 
+    def test_broad_auto_matrix_keeps_each_selected_test_once(self):
+        for paths in (['src/peach/mp4repair.py', 'src/peach/web_media_repair.py'],
+                      ['src/peach/web_catalog.py']):
+            with self.subTest(paths=paths):
+                scopes, _ = runner.scopes_for_changes(paths)
+                plan = ci_plan.plan('push', paths)
+                windows = [row for row in plan['matrix']['include'] if row['os'] == 'windows-latest']
+                self.assertFalse(plan['wide'])
+                self.assertEqual(len(windows), 4)
+                self.assertEqual(len([row for row in plan['matrix']['include']
+                                      if row['os'] == 'macos-latest']), 1)
+                self.assertTrue(all(row['scope'] == 'auto' for row in windows))
+                with patch.dict(os.environ, CIFrontendOwnershipTests.CI):
+                    serial = list(CIFrontendOwnershipTests.ids(runner.build_suite(*scopes)))
+                    collected = [name for row in windows for name in CIFrontendOwnershipTests.ids(
+                        runner.build_suite(*scopes, shard_index=row['shard_index'],
+                                           shard_count=row['shard_count']))]
+                self.assertTrue(serial)
+                self.assertEqual(len(serial), len(set(serial)))
+                self.assertCountEqual(serial, collected)
+
+    def test_auto_partition_threshold_counts_unique_selected_files(self):
+        for count, expected in ((149, 1), (150, 4)):
+            with self.subTest(count=count), patch.object(runner, 'selected_files', return_value=tuple(
+                    runner.TESTS / f'test_selected_{index}.py' for index in range(count))):
+                plan = ci_plan.plan('pull_request', ['src/peach/web_catalog.py'])
+                windows = [row for row in plan['matrix']['include'] if row['os'] == 'windows-latest']
+                self.assertFalse(plan['wide'])
+                self.assertEqual(len(windows), expected)
+                self.assertTrue(all(row['scope'] == 'auto' for row in windows))
+
     def test_document_changes_avoid_optional_jobs_and_unknown_changes_require_them(self):
         documents = ci_plan.plan('pull_request', ['docs/TESTING.md'])
         self.assertEqual(documents['required_jobs'], ['plan', 'python', 'workflow-lint', 'frontend-ready'])
@@ -683,6 +714,7 @@ class TestPlanningTests(unittest.TestCase):
             for test in (first, second):
                 result.startTest(test)
                 result.stopTest(test)
+            result.stopTestRun()
         self.assertEqual(result.files, {'test_alpha': 6.0, 'test_beta': 4.0})
         self.assertEqual([seconds for seconds, _ in result.timings], [1.0, 1.0])
         with tempfile.TemporaryDirectory() as directory:
@@ -692,6 +724,27 @@ class TestPlanningTests(unittest.TestCase):
             self.assertEqual(runner.load_file_seconds(table), {'test_alpha': 2.5, 'test_beta': 4.0})
             table.write_text('不是 JSON', encoding='utf-8')
             self.assertEqual(runner.load_file_seconds(table), {})
+
+    def test_background_thread_exceptions_fail_the_suite_and_restore_the_hook(self):
+        import threading
+        previous = threading.excepthook
+        def crash():
+            raise RuntimeError('background fixture failed')
+        class Case(unittest.TestCase):
+            def runTest(self):
+                thread = threading.Thread(target=crash, name='fixture-worker')
+                thread.start()
+                thread.join()
+        with patch.object(threading, 'excepthook') as original_hook:
+            result = unittest.TextTestRunner(stream=io.StringIO(), resultclass=runner.TimedResult).run(
+                unittest.TestSuite([Case()]))
+            self.assertIs(threading.excepthook, original_hook)
+            original_hook.assert_called_once()
+        self.assertIs(threading.excepthook, previous)
+        self.assertFalse(result.wasSuccessful())
+        self.assertEqual(len(result.errors), 1)
+        self.assertIn('background fixture failed', result.errors[0][1])
+        self.assertTrue(any(row['outcome'] == 'error' for row in result.results))
 
     def test_jobs_accepts_auto_or_a_positive_integer(self):
         self.assertEqual(runner.resolve_jobs('3'), 3)

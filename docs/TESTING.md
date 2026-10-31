@@ -75,6 +75,10 @@ Dependabot 的 PR 一律在本地接管，不在网页上合：
 
 Python 静态检查使用开发依赖 Ruff，随每个正式测试域扫描全仓自有 Python 文件，覆盖应用、脚本、测试和打包入口。规则为 Pyflakes（`F`）、Ruff 支持的 Pylint 错误规则（`PLE`），以及可变默认参数、`finally` 跳转、无效表达式和循环闭包规则（`B006`、`B012`、`B018`、`B023`）。生成的 `downloads_clouddrive_pb2.py` 排除；公开导出的导入用显式同名别名声明。命名、行数、空行和复杂度偏好不属于这套 lint 门槛。
 
+无效转义由 Ruff `W605` 阻断，Windows 路径使用原始字符串或双反斜杠。正式入口和定向调试都将未处理的后台线程异常记为测试错误，保留原始 traceback；临时账本须在线程退出后清理。Starlette TestClient 使用开发依赖 `httpx2`，应用的 HTTP 客户端仍按运行时清单安装。
+
+前端通过 `allowScripts` 逐项登记安装脚本策略，未登记脚本由 `frontend/.npmrc` 拒绝安装。`@sentry/cli` 使用锁文件中的平台二进制包，禁用额外下载脚本；`fsevents` 的可选原生构建也禁用，文件监听沿用 Node 提供的能力。升级后核对实际安装、构建和 CLI 可用性，不批量放行脚本。
+
 文档与文案检查包含 seiso 稳定规则和最终状态检查，随正式入口执行。分类、范围、独立检查与预览规则用法见 [文档与界面文案](WRITING.md#检查与复核)。seiso 由开发依赖与锁文件固定，运行 Peach 不需要它。
 
 不是每次都跑全量：本机按改动涉及的域选测，CI 按提交类型决定覆盖多宽。
@@ -90,7 +94,7 @@ Python 静态检查使用开发依赖 Ruff，随每个正式测试域扫描全�
 | wheel | Windows 与 macOS 各一次 Python 3.14 独立最小安装 |
 | Release | 复用同 SHA 主线成功 CI；Windows 独立 EXE 与 Apple Silicon、Intel DMG 分别构建和验收 |
 
-Python 全量按文件稳定分片，Windows 四片、macOS 两片，每片使用独立 runner；汇总任务要求所有分片和计划选择的任务成功。分片子进程不签发记录。
+Python 全量按文件稳定分片，Windows 四片、macOS 两片。`auto` 按影响域选择文件；唯一选测文件达到 150 个时，Windows 复用四片分配，macOS 仍用单片；更小的 `auto` 两端均用单片。每片使用独立 runner，仍按同一基线和影响域运行，汇总任务要求所有分片和计划选择的任务成功。分片子进程不签发记录。
 
 Test 工作流的 `web-bundle` 在 Ubuntu 上统一执行 tsc、lint、Vitest、构建及产物差异检查；lint 同时检查无诊断且扫描文件数大于零。CI 的 Python 任务把这三个工具用例交给前端任务，把两个真实浏览器用例交给浏览器矩阵；同模块的契约测试仍执行。任务身份由固定工作流与 job 名识别，未知任务和本机保留完整测试。承担部分 CI 职责的运行不签发本机测试记录。
 

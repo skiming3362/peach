@@ -12,6 +12,8 @@ import { useLayoutEffect, useReducer, useRef, type MouseEvent, type ReactNode } 
 import { avatarInner } from '@peach/card-art';
 
 import { apiGet, apiSend } from '../../api';
+import { entityDisplayName } from '../../core/entity-names';
+import { useEntityNames } from '../use-entity-names';
 import { TabCount } from '../components/board-tabs';
 import { PillTabList } from '../components/pill-tabs';
 import {
@@ -391,6 +393,7 @@ function Row({ entry, active, helpers, onPick, onPeek, onRemove }: {
   entry: SearchOption; active: boolean; helpers: SearchProps['helpers'];
   onPick(entry: SearchOption): void; onPeek(card: SuggestCard): void; onRemove(value: string): Promise<void>;
 }) {
+  useEntityNames();
   const shared = {
     'data-search-value': entry.value, 'data-active': active ? '' : undefined,
     onClick: (event: MouseEvent) => {
@@ -443,8 +446,8 @@ function Row({ entry, active, helpers, onPick, onPeek, onRemove }: {
     return (
       <div data-search-option="person" data-open-entity={opens} {...shared} onMouseDown={keep}>
         <Face item={item} kind={kind} />
-        <button type="button" data-search-person="" data-search-meta="" aria-label={`查看 ${item.value}`}>
-          <span data-search-name=""><span>{item.value}</span>{matched}</span>
+        <button type="button" data-search-person="" data-search-meta="" aria-label={`查看 ${entityDisplayName(kind, item.value)}`}>
+          <span data-search-name=""><span>{entityDisplayName(kind, item.value)}</span>{matched}</span>
           <span data-search-sub="">{sub}</span>
         </button>
         {works.length ? (
