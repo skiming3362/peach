@@ -663,12 +663,12 @@ def without_ci_frontend_tests(suite: unittest.TestSuite) -> unittest.TestSuite:
 
 def build_suite(*scopes: str, shard_index: int = 0, shard_count: int = 1,
                 assigned_names: Iterable[str] | None = None) -> unittest.TestSuite:
-    """本片的用例。`assigned_names` 是父进程按耗时划好的文件名；不给时按文件名轮转（CI 分片）。"""
+    """本片的用例；本机父进程或 Windows CI 按耗时分配，其余按文件名轮转。"""
     loader = unittest.defaultTestLoader
     suite = unittest.TestSuite()
     files = sorted({path for scope in scopes for path in selected_files(scope)})
     if assigned_names is None:
-        assigned = set(files[shard_index::shard_count])
+        assigned = assigned_files(files, shard_index, shard_count)
     else:
         assigned = {TESTS / name for name in assigned_names}
         if not assigned <= set(files):
@@ -686,6 +686,17 @@ def build_suite(*scopes: str, shard_index: int = 0, shard_count: int = 1,
     finally:
         del sys.path[:2]
     return without_ci_frontend_tests(suite) if ci_frontend_delegated() else suite
+
+
+def assigned_files(files: Iterable[Path], index: int, count: int) -> set[Path]:
+    """Windows 独立 CI 分片共用固定耗时表，本机与未知任务保持原分配。"""
+    files = sorted(files)
+    if (count > 1 and ci_frontend_delegated() and os.environ.get("GITHUB_JOB") == "python"
+            and os.environ.get("RUNNER_OS") == "Windows"):
+        seconds = json.loads((ROOT / "scripts/ci-python-timings.json").read_text(encoding="utf-8"))["seconds"]
+        groups = shard_plan((path.name for path in files), count, seconds, prior_seconds={})
+        return {TESTS / name for name in groups[index]} if index < len(groups) else set()
+    return set(files[index::count])
 
 
 class TimedResult(unittest.TextTestResult):
@@ -846,7 +857,7 @@ PRIOR_SECONDS = {"test_web_e2e.py": 900.0}
 
 
 def shard_plan(names: Iterable[str], shard_count: int,
-               seconds: dict[str, float]) -> list[list[str]]:
+               seconds: dict[str, float], *, prior_seconds: dict[str, float] | None = None) -> list[list[str]]:
     """按预计秒数把测试文件装进分片：先长后短，每个文件放进当前最空的一片。
 
     返回的分片按预计总时长降序排列，派发按这个顺序，最长的先开跑。等负载时按文件数择空。
@@ -856,7 +867,8 @@ def shard_plan(names: Iterable[str], shard_count: int,
     names = sorted(names)
     known = sorted(value for value in seconds.values() if value > 0)
     default = known[len(known) // 2] if known else 1.0
-    weight = {name: max(seconds.get(name.removesuffix(".py"), default), PRIOR_SECONDS.get(name, 0.0))
+    priors = PRIOR_SECONDS if prior_seconds is None else prior_seconds
+    weight = {name: max(seconds.get(name.removesuffix(".py"), default), priors.get(name, 0.0))
               for name in names}
     groups: list[list[str]] = [[] for _ in range(max(1, min(shard_count, len(names))))]
     totals = [0.0] * len(groups)
@@ -1177,7 +1189,7 @@ def run_shard_child(args, requested, scopes, files) -> int:
         temporary.replace(args.timings)
     if args.shard_plan is None:
         # CI 的独立分片没有父进程替它汇总，自己写一次历史。
-        names = [path.name for path in sorted(files)][args.shard_index::args.shard_count]
+        names = sorted(path.name for path in assigned_files(files, args.shard_index, args.shard_count))
         test_history.append(ROOT, scope=f"{' '.join(requested)}:{' '.join(scopes)} "
                             f"shard {args.shard_index + 1}/{args.shard_count}",
                             rows=rows, files=[name.removesuffix(".py") for name in names])

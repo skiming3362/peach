@@ -107,6 +107,10 @@ class SourcePaused(RuntimeError):
     """来源冷却期内停止请求，保留已有图像。"""
 
 
+class SourceBudgetExhausted(SourcePaused):
+    """本趟采集预算耗尽，不能作为单个来源的冷却跳过。"""
+
+
 def cooldown_path(root: Path, source: str) -> Path:
     """这个来源的冷却记录。键是来源名；没有来源名的请求按主机名散列，见 `SourceTransport`。"""
     return Path(root) / ("scraping-" + source + ".cooldown.json")
@@ -443,15 +447,15 @@ class SourceTransport:
             request = HttpRequest(request.method, request.url,
                                   {**headers, "Accept-Language": "zh-CN,zh;q=0.9"}, request.body)
         if self.max_requests and self.requests >= self.max_requests:
-            raise SourcePaused("本趟采集次数已用完，再跑一次接着采；已有图片保留")
+            raise SourceBudgetExhausted("本趟采集次数已用完，再跑一次接着采；已有图片保留")
         if self.deadline:
             timeout = min(timeout, self.deadline - time.monotonic())
             if timeout <= 0:
-                raise SourcePaused("本趟采集时间已用完，再跑一次接着采；已有图片保留")
+                raise SourceBudgetExhausted("本趟采集时间已用完，再跑一次接着采；已有图片保留")
         if self.max_bytes:
             remaining = self.max_bytes - self.bytes
             if remaining <= 0:
-                raise SourcePaused("本趟下载量已用完，再跑一次接着采；已有图片保留")
+                raise SourceBudgetExhausted("本趟下载量已用完，再跑一次接着采；已有图片保留")
             max_bytes = min(max_bytes, remaining - 1)
         key = source or hashlib.sha256(hostname_of(request.url).encode()).hexdigest()
         cooldown = cooldown_path(self.root, key)

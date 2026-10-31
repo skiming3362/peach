@@ -38,6 +38,12 @@ def input_identity(root: Path, target: str, arch: str, *, toolchain: dict | None
             "toolchain": toolchain, "inputs": {name: digest(root / name) for name in INPUTS}}
 
 
+def github_cache_key(identity: dict) -> str:
+    """Actions 外层缓存与包内回执采用同一构建身份。"""
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return f"{identity['target']}-media-v2-{identity['arch']}-{hashlib.sha256(encoded).hexdigest()}"
+
+
 def remove_owned(root: Path, path: Path) -> None:
     base = (root / "build").resolve()
     if not base.is_relative_to(root.resolve()) or path.is_symlink() or not path.resolve().is_relative_to(base) or path.resolve() == base:
@@ -121,10 +127,14 @@ def main() -> None:
     parser.add_argument("target", choices=("windows", "macos"))
     parser.add_argument("--arch", choices=("arm64", "x86_64"), default="x86_64")
     parser.add_argument("--tool", choices=("ffmpeg", "untrunc"))
+    parser.add_argument("--github-key", action="store_true", help="只输出包含工具链身份的 Actions 缓存键")
     args = parser.parse_args()
     if args.target == "windows" and args.arch != "x86_64":
         parser.error("Windows 媒体工具只构建 x86_64")
-    print(json.dumps(build(Path.cwd(), args.target, args.arch, args.tool)))
+    if args.github_key:
+        print(github_cache_key(input_identity(Path.cwd(), args.target, args.arch)))
+    else:
+        print(json.dumps(build(Path.cwd(), args.target, args.arch, args.tool)))
 
 
 if __name__ == "__main__":

@@ -2294,6 +2294,8 @@ def _generate_preview(config, row, database, resolver, *, progress):
     digest = hashlib.sha1(str(row['path']).encode('utf-8')).hexdigest()[:16]
     destination = root / 'local' / digest[:2] / (digest + '.jpg')
     if not artifact_rules.current(destination) or not measure_image_file(destination):
+        from .hardware_transcode import frame_decode_options
+        decode_options = frame_decode_options(str(choice.path), str(video))
         with tempfile.TemporaryDirectory(prefix='peach-preview-') as temporary:
             frames = Path(temporary)
             for index in range(9):
@@ -2304,7 +2306,7 @@ def _generate_preview(config, row, database, resolver, *, progress):
                 diagnostic = {}
                 if not frame_capture.capture_with_retry(
                         str(choice.path), str(video), timestamp, frames / f's{index:02d}.jpg',
-                        diagnostics=diagnostic, timeout=remaining(45)):
+                        diagnostics=diagnostic, timeout=remaining(45), decode_options=decode_options):
                     for attempt in diagnostic.get('attempts', []):
                         attempt['stderr'] = attempt.get('stderr', '').replace(str(video), '<media>')[-4096:]
                     diagnostic['stderr'] = diagnostic.get('stderr', '').replace(str(video), '<media>')[-4096:]

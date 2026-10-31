@@ -20,20 +20,15 @@ from pathlib import Path, PureWindowsPath
 from unittest.mock import patch
 
 from peach import catalog_rules, scan
-from peach.migrations import upgrade
+from support.ledger import fresh_ledger
 from support.web import route_client
-
-ROOT = Path(__file__).resolve().parents[1]
-MIGRATIONS = ROOT / "migrations"
-
 
 class _ScanCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name).resolve()
-        self.db = self.root / "ledger.db"
-        upgrade(self.db, MIGRATIONS)
+        self.db = fresh_ledger(self.root)
         self.media = self.root / "media"
         (self.media / "创作者" / "sub").mkdir(parents=True)
         (self.media / "创作者" / "sub" / "a.mp4").write_bytes(b"0" * 10)

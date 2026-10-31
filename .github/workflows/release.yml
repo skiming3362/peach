@@ -51,27 +51,20 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
-      - name: 复用固定源码的媒体工具与对应源码包
-        id: media-cache
-        uses: actions/cache@v6.1.0
-        with:
-          key: windows-media-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build_ffmpeg_windows.sh', 'scripts/dav1d-mingw64.ini', 'scripts/build_untrunc_windows.sh', 'scripts/fetch_ffmpeg_sources.py', 'scripts/fetch_untrunc_sources.py', 'scripts/ffmpeg-sources.json', 'scripts/untrunc-sources.json') }}
-          path: |
-            build/ffmpeg-windows/ffmpeg
-            build/ffmpeg-windows/ffmpeg-corresponding-source.zip
-            build/untrunc-windows/untrunc
-            build/untrunc-windows/untrunc-corresponding-source.zip
       - name: 安装交叉编译工具
-        if: steps.media-cache.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential gcc-mingw-w64-x86-64-posix g++-mingw-w64-x86-64-posix mingw-w64-x86-64-dev nasm pkg-config python3 clang meson ninja-build cmake ca-certificates curl xz-utils
-      - name: 构建固定版本媒体工具
-        if: steps.media-cache.outputs.cache-hit != 'true'
-        run: bash scripts/build_ffmpeg_windows.sh build/ffmpeg-windows
-      - name: 构建固定版本索引修复工具
-        if: steps.media-cache.outputs.cache-hit != 'true'
-        run: bash scripts/build_untrunc_windows.sh build/untrunc-windows
+      - name: 核对媒体构建身份
+        id: media-identity
+        run: echo "key=$(python3 scripts/media_build_cache.py windows --github-key)" >> "$GITHUB_OUTPUT"
+      - name: 复用固定源码的媒体工具与对应源码包
+        uses: actions/cache@v6.1.0
+        with:
+          key: ${{ steps.media-identity.outputs.key }}
+          path: build/media-cache/windows-x86_64
+      - name: 校验或构建媒体工具与对应源码包
+        run: python3 scripts/media_build_cache.py windows
       - uses: actions/upload-artifact@v7
         with:
           name: ffmpeg-windows
@@ -303,17 +296,18 @@ jobs:
           uv sync --locked --all-extras --python python
           uv pip check --python .venv/bin/python
           npm ci --prefix frontend
-      # 与 scripts/ci_macos.sh 相同的媒体工具准备：缓存按 media_build_cache.py 的输入与工具链身份核对，
-      # 不一致时在本机重新编译。
-      - name: 复用固定源码的 macOS 媒体工具与对应源码包
-        uses: actions/cache@v6.1.0
-        with:
-          key: macos-media-v1-${{ matrix.arch }}-${{ runner.os }}-${{ hashFiles('scripts/ffmpeg-sources.json', 'scripts/untrunc-sources.json', 'scripts/build_macos_media.py', 'scripts/fetch_ffmpeg_sources.py', 'scripts/fetch_untrunc_sources.py', 'scripts/setup_macos_media_tools.py', 'scripts/media_build_cache.py', 'src/peach/user_agent.py', 'LICENSE') }}
-          path: build/media-cache/macos-${{ matrix.arch }}
       - name: 安装固定版本的媒体编译工具
         run: |
           .venv/bin/python scripts/setup_macos_media_tools.py --root build/macos-media-toolchain
           echo "$PWD/build/macos-media-toolchain/env/bin" >> "$GITHUB_PATH"
+      - name: 核对媒体构建身份
+        id: media-identity
+        run: echo "key=$(.venv/bin/python scripts/media_build_cache.py macos --arch '${{ matrix.arch }}' --github-key)" >> "$GITHUB_OUTPUT"
+      - name: 复用固定源码的 macOS 媒体工具与对应源码包
+        uses: actions/cache@v6.1.0
+        with:
+          key: ${{ steps.media-identity.outputs.key }}
+          path: build/media-cache/macos-${{ matrix.arch }}
       - name: 构建或复用媒体工具并取得 cloudflared
         run: |
           for tool in ffmpeg untrunc; do

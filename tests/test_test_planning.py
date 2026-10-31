@@ -293,6 +293,27 @@ class TestPlanningTests(unittest.TestCase):
         costs = [row['estimated_seconds'] for row in matrix]
         self.assertLess(max(costs) - min(costs), 60)
 
+    def test_windows_python_partitions_balance_recorded_cost_and_keep_every_case(self):
+        seconds = json.loads((runner.ROOT / 'scripts/ci-python-timings.json').read_text(encoding='utf-8'))['seconds']
+        files = runner.selected_files('full')
+        with patch.dict(os.environ, {**CIFrontendOwnershipTests.CI, 'RUNNER_OS': 'Windows'}):
+            groups = [runner.assigned_files(files, index, 4) for index in range(4)]
+            serial = list(CIFrontendOwnershipTests.ids(runner.build_suite('full')))
+            collected = [name for index in range(4) for name in CIFrontendOwnershipTests.ids(
+                runner.build_suite('full', shard_index=index, shard_count=4))]
+        self.assertCountEqual(serial, collected)
+        self.assertEqual(len(collected), len(set(collected)))
+        self.assertCountEqual(files, [path for group in groups for path in group])
+        costs = [sum(seconds.get(path.stem, 1) for path in group) for group in groups]
+        self.assertLess(max(costs) - min(costs), 5)
+        self.assertGreater(len(groups[0]), 1)
+
+    def test_unassigned_ci_and_macos_keep_filename_partitions(self):
+        files = [runner.TESTS / f'test_selected_{index}.py' for index in range(8)]
+        for environment in ({'RUNNER_OS': 'Windows'}, {**CIFrontendOwnershipTests.CI, 'RUNNER_OS': 'macOS'}):
+            with self.subTest(environment=environment), patch.dict(os.environ, environment, clear=True):
+                self.assertEqual(runner.assigned_files(files, 1, 4), set(files[1::4]))
+
     def test_broad_auto_matrix_keeps_each_selected_test_once(self):
         for paths in (['src/peach/mp4repair.py', 'src/peach/web_media_repair.py'],
                       ['src/peach/web_catalog.py']):

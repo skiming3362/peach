@@ -54,7 +54,7 @@ Run = Callable[..., subprocess.CompletedProcess]
 
 @dataclass(frozen=True)
 class Step:
-    """一步准备的结果。`state` 取 skipped / current / stale / synced / applied / failed。"""
+    """一步准备的结果。`state` 取 skipped / pending / current / stale / synced / applied / failed。"""
 
     name: str
     state: str
@@ -257,7 +257,7 @@ def record(state_dir: Path, steps: Iterable[Step], *, pid: int | None = None) ->
     payload = {
         "pid": os.getpid() if pid is None else pid,
         "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "ok": not any(step.problem for step in items),
+        "ok": not any(step.problem or step.state == "pending" for step in items),
         "steps": [asdict(step) for step in items],
     }
     directory = Path(state_dir)

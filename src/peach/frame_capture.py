@@ -87,13 +87,17 @@ def capture_frame(ffmpeg: str, path: str, timestamp: float, destination: Path, *
 
 def capture_with_retry(ffmpeg: str, path: str, timestamp: float, destination: Path,
                        *, width: int = 480, timeout: float = 45,
-                       diagnostics: dict | None = None) -> bool:
-    """抽一帧；只在错误明说色彩元数据不合法时，带 bt709 声明重试一次。"""
+                       diagnostics: dict | None = None,
+                       decode_options: tuple[str, ...] | None = None) -> bool:
+    """抽一帧；坏色彩元数据可重试一次，同部多帧可复用 decode_options。
+
+    None 表示现场探测，空元组表示软件解码；硬件失败仍在本帧内回退。
+    """
     from .smb_media import input_url
     path = input_url(path)
     from .hardware_transcode import frame_decode_options
     deadline = time.monotonic() + timeout
-    hardware = frame_decode_options(ffmpeg, path)
+    hardware = frame_decode_options(ffmpeg, path) if decode_options is None else decode_options
     attempts, detail, ok = [], {}, False
     for options in ((hardware, ()) if hardware else ((),)):
         remaining = deadline - time.monotonic()

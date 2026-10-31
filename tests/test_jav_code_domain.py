@@ -55,6 +55,7 @@ from peach.catalog_rules import (
 from peach import scripting
 from peach.migrations import upgrade
 from peach.review_csv import write_rows
+from support.ledger import fresh_ledger
 
 MIGRATIONS = Path(__file__).resolve().parents[1] / "migrations"
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "audit_domain_codes.py"
@@ -749,9 +750,7 @@ class ApplyTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name).resolve()
-        self.db = self.root / "ledger.db"
-        sqlite3.connect(self.db).close()
-        upgrade(self.db, MIGRATIONS)
+        self.db = fresh_ledger(self.root)
         self.review = self.root / "review.csv"
 
     def _asset(self, asset_id, path, code):
@@ -853,10 +852,8 @@ class RevertMisreadCodeTests(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        self.root = Path(tmp.name)
-        self.db = self.root / "ledger.db"
-        sqlite3.connect(self.db).close()
-        upgrade(self.db, MIGRATIONS)
+        self.root = Path(tmp.name).resolve()
+        self.db = fresh_ledger(self.root)
         connection = sqlite3.connect(self.db)
         connection.executemany(
             "INSERT INTO asset(id,location,path,name,medium,code,catalog_title,field_owners) "

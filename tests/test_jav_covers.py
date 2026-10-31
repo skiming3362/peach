@@ -5,6 +5,7 @@ import json
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import call, patch
@@ -114,6 +115,122 @@ class FetchRetryTests(unittest.TestCase):
             winner, size, _ = covers.best_cover(transport_for({cached.url: (200, jpeg(800, 540))}),
                                                 'SSIS-057', 0, prior_candidates=(cached,))
         self.assertEqual((winner, size), (cached, (800, 540)))
+
+    def test_paused_catalogs_keep_an_already_available_candidate(self):
+        candidate = covers.candidate_for('https://official.example/cached.jpg')
+        for site, code in (('r18_evidence', 'SSIS-057'), ('mgstage_images', '200GANA-1995'),
+                           ('prestige_images', 'ABW-192')):
+            with self.subTest(site=site), \
+                    patch.object(covers, 'dmm_evidence', return_value=covers.MetadataEvidence()), \
+                    patch.object(covers, 'r18_evidence', return_value=covers.MetadataEvidence()), \
+                    patch.object(covers, 'mgstage_images', return_value=[]), \
+                    patch.object(covers, 'prestige_images', return_value=[]), \
+                    patch.object(covers, site, side_effect=covers.SourcePaused('来源正在冷却')):
+                winner, size, _ = covers.best_cover(
+                    transport_for({candidate.url: (200, jpeg(800, 540))}), code, 0,
+                    prior_candidates=(candidate,))
+                self.assertEqual((winner, size), (candidate, (800, 540)))
+
+    def test_a_paused_group_site_does_not_hide_the_other_sites_candidate(self):
+        candidate = covers.candidate_for('https://official.example/live.jpg')
+        for paused, available in (('prestige_images', 'mgstage_images'),
+                                   ('mgstage_images', 'prestige_images')):
+            with self.subTest(paused=paused), \
+                    patch.object(covers, paused, side_effect=covers.SourcePaused('来源正在冷却')), \
+                    patch.object(covers, available, return_value=[candidate]):
+                winner, _, _ = covers.best_cover(
+                    transport_for({candidate.url: (200, jpeg(1600, 1080))}), 'ABW-192', 0)
+                self.assertEqual(winner, candidate)
+
+    def test_a_persisted_cooldown_keeps_the_cached_candidate_and_cooldown_record(self):
+        from peach.http import HttpResponse
+        from peach.scraping_access import SourceTransport, cooldown_path, pause_source
+        candidate = covers.candidate_for('https://available.example/cover.jpg')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            pause_source(root, 'prestige', retry_after=60)
+            cooldown = cooldown_path(root, 'prestige')
+            before = cooldown.read_bytes()
+            transport = SourceTransport(root)
+            for site in ('mgstage', 'r18dev'):
+                transport.transports[site] = lambda *_args: HttpResponse(404, {}, b'')
+            transport.transports[None] = lambda *_args: HttpResponse(200, {}, jpeg(800, 540))
+            with patch('peach.scraping_access.client_for') as client:
+                winner, _, _ = covers.best_cover(transport, 'ABW-192', 0, prior_candidates=(candidate,))
+            self.assertEqual(winner, candidate)
+            self.assertEqual(cooldown.read_bytes(), before)
+            client.assert_not_called()
+
+    def test_a_paused_image_probe_or_download_keeps_other_candidates(self):
+        paused = covers.candidate_for('https://paused.example/cover.jpg')
+        available = covers.candidate_for('https://available.example/cover.jpg')
+        for phase in ('probe', 'download'):
+            def transport(request, _timeout, _limit, phase=phase):
+                if request.url == paused.url:
+                    if phase == 'probe' or 'Range' not in request.headers:
+                        raise covers.SourcePaused('来源正在冷却')
+                    return _Response(200, jpeg(1600, 1080))
+                return _Response(200, jpeg(800, 540))
+            with self.subTest(phase=phase):
+                winner, _, _ = covers.best_cover(transport, 'FC2-PPV-123456', 0,
+                                                 prior_candidates=(paused, available))
+                self.assertEqual(winner, available)
+
+    def test_unanswered_images_preserve_paused_and_other_failure_results(self):
+        first = covers.candidate_for('https://paused.example/cover.jpg')
+        second = covers.candidate_for('https://offline.example/cover.jpg')
+        for all_paused in (False, True):
+            def transport(request, _timeout, _limit, all_paused=all_paused):
+                if request.url == first.url or all_paused:
+                    raise covers.SourcePaused('来源正在冷却')
+                return _Response(503, b'')
+            expected = covers.SourcePaused if all_paused else covers.Unavailable
+            with self.subTest(all_paused=all_paused):
+                with self.assertRaises(expected) as caught:
+                    covers.best_cover(transport, 'FC2-PPV-123456', 0, prior_candidates=(first, second))
+                self.assertNotIsInstance(caught.exception, covers.NotFound)
+
+    def test_catalogs_that_are_all_paused_remain_paused_not_missing(self):
+        def transport(*_args):
+            raise covers.SourcePaused('来源正在冷却')
+        for code in ('SSIS-057', '200GANA-1995', 'ABW-192'):
+            with self.subTest(code=code), self.assertRaises(covers.SourcePaused):
+                covers.best_cover(transport, code, 0)
+
+    def test_a_spent_run_budget_stops_before_trying_another_candidate(self):
+        from peach.scraping_access import SourceTransport
+        candidates = tuple(covers.candidate_for(f'https://{name}.example/cover.jpg')
+                           for name in ('first', 'second'))
+        with tempfile.TemporaryDirectory() as directory:
+            transports = [SourceTransport(Path(directory), max_requests=1),
+                          SourceTransport(Path(directory), max_bytes=1),
+                          SourceTransport(Path(directory), max_seconds=1)]
+            transports[0].requests = transports[1].bytes = 1
+            transports[2].deadline = time.monotonic() - 1
+            for transport in transports:
+                for code in ('FC2-PPV-123456', 'ABW-192', 'SSIS-057'):
+                    with self.subTest(transport=transport, code=code), \
+                            patch('peach.scraping_access.client_for') as client:
+                        with self.assertRaises(covers.SourcePaused) as caught:
+                            covers.best_cover(transport, code, 0, prior_candidates=candidates)
+                        self.assertIn('本趟', str(caught.exception))
+                        self.assertEqual(covers.failure_log_row(code, caught.exception)['outcome'], 'unavailable')
+                        client.assert_not_called()
+
+    def test_image_checks_preserve_cancellation_and_deadline_exceptions(self):
+        from peach.processing_control import ItemSkipped
+        candidate = covers.candidate_for('https://official.example/full.jpg')
+        for error in (InterruptedError('处理任务已停止'), ItemSkipped('跳过当前项'),
+                      covers.DeadlineExceeded('动作预算已用尽')):
+            for phase in ('probe', 'download'):
+                def transport(request, _timeout, _limit, phase=phase, error=error):
+                    if phase == 'download' and 'Range' in request.headers:
+                        return _Response(200, jpeg(800, 540))
+                    raise error
+                with self.subTest(error=type(error).__name__, phase=phase):
+                    with self.assertRaises(type(error)) as caught:
+                        covers.best_cover(transport, 'FC2-PPV-123456', 0, prior_candidates=(candidate,))
+                    self.assertIs(caught.exception, error)
 
     def test_unanswered_catalogs_without_candidates_are_retryable(self):
         diagnostics = {}

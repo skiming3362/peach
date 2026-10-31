@@ -3314,6 +3314,38 @@ class LibraryPreviewCompletionTests(unittest.TestCase):
         self.assertEqual(second['status'], 'complete')
         capture.assert_not_called()
 
+    def test_one_video_reuses_decode_probe_for_all_nine_frames(self):
+        from peach import frame_capture, hardware_transcode
+        from peach.media_io import file_stat
+        ffmpeg = self.root / ('ffmpeg.exe' if os.name == 'nt' else 'ffmpeg')
+        ffmpeg.write_bytes(b'fixture')
+        ffmpeg.with_name('ffprobe' + ffmpeg.suffix).write_bytes(b'fixture')
+        self.resolver.ffmpeg.return_value = SimpleNamespace(path=ffmpeg)
+        timestamps = []
+
+        def capture(_ffmpeg, _source, timestamp, destination, **options):
+            timestamps.append(timestamp)
+            self.assertEqual(options['input_options'], ('-hwaccel', 'd3d11va'))
+            Image.new('RGB', (480, 270), 'green').save(destination, format='JPEG')
+            return True, ''
+
+        with patch('peach.library_processing.FFmpegResolver', return_value=self.resolver), \
+                patch('peach.hardware_transcode.sys.platform', 'win32'), \
+                patch.object(hardware_transcode, '_d3d11va_ready', return_value=True), \
+                patch.object(hardware_transcode, '_frame_codec', return_value='hevc'), \
+                patch('peach.media_processing_policy.acceleration', return_value='auto'), \
+                patch('peach.media_io.file_stat', wraps=file_stat) as reads, \
+                patch.object(frame_capture, 'capture_frame', side_effect=capture), \
+                patch.object(frame_capture, 'tile_frames', side_effect=self.make_tile):
+            result = self.run_processing(stage='previews')
+        self.assertEqual(result['status'], 'complete')
+        self.assertEqual(result['previews'], 1)
+        self.assertEqual(len(set(timestamps)), 9)
+        self.assertEqual(reads.call_count, 1)
+        with self.database.read_connection() as connection:
+            snapshot = connection.execute('SELECT snapshot_path FROM asset WHERE id=1').fetchone()[0]
+        self.assertTrue(Path(snapshot).is_file())
+
     def test_preview_only_leaves_candidates_and_sources_untouched(self):
         factory = Mock(side_effect=AssertionError('外部资料不属于预览任务'))
         with patch('peach.library_processing.FFmpegResolver', return_value=self.resolver), \
@@ -3444,7 +3476,8 @@ class LibraryPreviewCompletionTests(unittest.TestCase):
         import zipfile
         from peach import support_bundle
 
-        def fail(_ffmpeg, video, _timestamp, _destination, *, diagnostics, timeout):
+        def fail(_ffmpeg, video, _timestamp, _destination, *, diagnostics, timeout, decode_options):
+            self.assertEqual(decode_options, ())
             self.assertGreater(timeout, 0)
             self.assertLessEqual(timeout, 45)
             diagnostics.update(reason='ffmpeg_error', returncode=69, timestamp_seconds=2.4667,

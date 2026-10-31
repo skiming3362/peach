@@ -1,12 +1,89 @@
 import assert from 'node:assert/strict';
+import { once } from 'node:events';
+import { createServer } from 'node:http';
 import { after, before, describe, it } from 'node:test';
-import type { Browser } from 'playwright-core';
-import { configurationBody, expectBody, launch, layout, requiredEnv, settle, visit, VIEWPORTS } from './harness.ts';
+import type { Browser, Page } from 'playwright-core';
+import { configurationBody, expectBody, launch, layout, requiredEnv, settle, visit, VIEWPORTS, type Visit } from './harness.ts';
+
+async function forwardHttp(page: Page, origin: string, service: string, signal: AbortSignal): Promise<void> {
+  await page.route(`${origin}/**`, async route => {
+    const request = route.request();
+    const url = new URL(request.url());
+    try {
+      const response = await route.fetch({ url: service + url.pathname + url.search, maxRedirects: 0, signal,
+        headers: { ...request.headers(), host: new URL(service).host, origin: service } });
+      await route.fulfill({ response });
+    } catch (error) {
+      if (signal.aborted && error instanceof Error && error.name === 'AbortError' && error.cause === signal.reason) {
+        await route.abort();
+        return;
+      }
+      if (!/already handled|disposed|closed/i.test(String(error))) throw error;
+    }
+  });
+}
+
+async function closeHttp(opened: Pick<Visit, 'page' | 'close'>, forwards: AbortController,
+  phase: (value: string) => void = () => {}): Promise<void> {
+  try {
+    phase('离开播放器页面');
+    await opened.page.goto('about:blank');
+  } finally {
+    // route.fetch 使用独立的 API 请求；先取消它，再等待路由回调结束。
+    phase('取消请求转发');
+    forwards.abort();
+    try {
+      phase('等待请求转发结束');
+      await opened.page.unrouteAll({ behavior: 'wait' });
+    } finally {
+      phase('关闭浏览器上下文');
+      await opened.close();
+    }
+  }
+}
 
 describe('普通 HTTP 的配置与播放', () => {
   let browser: Browser;
   before(async () => { browser = await launch() });
   after(async () => { await browser?.close() });
+
+  it('离开页面会取消尚未结束的转发响应并完成路由清理', { timeout: 10_000 }, async t => {
+    let phase = '准备受控响应';
+    t.after(() => { if (t.signal.aborted) t.diagnostic(`HTTP 取消回归超时阶段：${phase}`); });
+    let notify!: () => void;
+    const started = new Promise<void>(resolve => { notify = resolve; });
+    let disconnected!: () => void;
+    const cancelled = new Promise<void>(resolve => { disconnected = resolve; });
+    const server = createServer((request, response) => {
+      if (request.url === '/') { response.end('<html><body>HTTP</body></html>'); return; }
+      if (request.url !== '/pending') { response.writeHead(404).end(); return; }
+      response.writeHead(200, { 'content-type': 'text/plain' });
+      response.write('pending');
+      response.on('close', disconnected);
+      notify();
+    });
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    const address = server.address();
+    assert.ok(address && typeof address !== 'string');
+    const context = await browser.newContext();
+    t.after(async () => {
+      await context.close();
+      server.closeAllConnections();
+      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    });
+    const page = await context.newPage();
+    const origin = 'http://peach-forward.test';
+    const forwards = new AbortController();
+    await forwardHttp(page, origin, `http://127.0.0.1:${address.port}`, forwards.signal);
+    await page.goto(origin);
+    await page.evaluate(() => { void fetch('/pending').catch(() => {}); });
+    phase = '等待转发开始';
+    await started;
+    await closeHttp({ page, close: () => context.close() }, forwards, value => { phase = value; });
+    phase = '等待服务端断连';
+    await cancelled;
+  });
 
   for (const viewport of VIEWPORTS) {
     it(`${viewport.name}：非安全来源打开配置、编辑索引器并挂载播放器`, { timeout: 60_000 }, async t => {
@@ -14,20 +91,11 @@ describe('普通 HTTP 的配置与播放', () => {
       t.after(() => { if (t.signal.aborted) t.diagnostic(`HTTP 配置用例超时阶段：${phase}`); });
       const service = requiredEnv('PEACH_E2E_ORIGIN');
       const origin = 'http://peach-http.test';
+      const forwards = new AbortController();
       const opened = await visit(browser, '/', viewport, async page => {
         // 只将临时演示服务映射到普通 HTTP 来源；浏览器自行决定 Web Crypto 的可用性。
-        // 跳转与关页会取消还在转发的请求（播放器的拉流尤其如此），那一趟落空不算失败；其余错误照常抛出。
-        await page.route(`${origin}/**`, async route => {
-          const request = route.request();
-          const url = new URL(request.url());
-          try {
-            const response = await route.fetch({ url: service + url.pathname + url.search, maxRedirects: 0,
-              headers: { ...request.headers(), host: new URL(service).host, origin: service } });
-            await route.fulfill({ response });
-          } catch (error) {
-            if (!/already handled|disposed|closed/i.test(String(error))) throw error;
-          }
-        });
+        // 跳转与关页会取消浏览器请求；独立转发请求由 closeHttp 在等待路由回调前取消。
+        await forwardHttp(page, origin, service, forwards.signal);
       });
       const { page, problems } = opened;
       try {
@@ -84,12 +152,7 @@ describe('普通 HTTP 的配置与播放', () => {
         await page.locator('#stage .video-js video.vjs-tech').waitFor();
         assert.deepEqual(problems, []);
       } finally {
-        phase = '离开播放器页面';
-        await page.goto('about:blank');
-        phase = '等待请求转发结束';
-        await page.unrouteAll({ behavior: 'wait' });
-        phase = '关闭浏览器上下文';
-        await opened.close();
+        await closeHttp(opened, forwards, value => { phase = value; });
       }
     });
   }
