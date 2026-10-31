@@ -21,6 +21,13 @@ Removed / Fixed / Security。
 
 ## [未发布]
 
+## [0.52.2] - 2026-10-31
+
+### 修复
+
+- **更新**：检查更新被拒时说明是限流还是网络故障。匿名调用 GitHub 接口按出口 IP 每小时只有 60 次额度，代理后面往往是一个出口被很多人共用，配额耗尽时接口返回 403；原来的实现把 403、404 和网络故障都归到「未能取得版本信息，请重试」，看不出该等配额恢复还是该检查网络。
+- **更新**：检查失败后十五分钟重试，而不是等满整个间隔。自动检查在查之前就把时间戳落成当前时刻，因此一次失败也被记成「这一天查过了」，要等满 24 小时才会再查；而限流往往几十分钟就恢复。
+
 ## [0.52.1] - 2026-10-31
 
 本机自用版本：更新源指向自己的 fork，账本里残留的乱码名字与标题按同番号证据修回。
@@ -831,7 +838,8 @@ Removed / Fixed / Security。
 - **桌面**：独立包使用 UTF-8 启动日志。
 - **配置**：首次设置后的跳转目标取新鲜读到的 mDNS 名。
 
-[未发布]: https://github.com/peach-mitao/peach/compare/v0.52.1...HEAD
+[未发布]: https://github.com/peach-mitao/peach/compare/v0.52.2...HEAD
+[0.52.2]: https://github.com/peach-mitao/peach/compare/v0.52.1...v0.52.2
 [0.52.1]: https://github.com/peach-mitao/peach/compare/v0.52.0...v0.52.1
 [0.52.0]: https://github.com/peach-mitao/peach/compare/v0.51.0...v0.52.0
 [0.51.0]: https://github.com/peach-mitao/peach/compare/v0.50.0...v0.51.0
