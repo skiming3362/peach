@@ -12,6 +12,7 @@ import tempfile
 import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from peach.release_updates import RELEASES_URL
 from peach.update_packages import MANIFEST, TOOL_PATHS, digest, read_manifest
 
 
@@ -28,7 +29,7 @@ def archive(destination: Path, root: Path, files: list[Path], manifest: dict | N
 def download_notes(version: str, *, lite_installer: bool = False,
                    download_base: str | None = None, macos: bool = False) -> str:
     """发布页的下载入口与包类型说明。"""
-    directory = (download_base or f"https://github.com/peach-mitao/peach/releases/download/v{version}").rstrip('/')
+    directory = (download_base or f"{RELEASES_URL}/download/v{version}").rstrip('/')
     base = f"{directory}/Peach-{version}-windows-x64"
     mac = (f"| [macOS Apple Silicon（DMG）]({directory}/Peach-{version}-macos-arm64.dmg) | Apple Silicon Mac |\n"
            f"| [macOS Intel（DMG）]({directory}/Peach-{version}-macos-x86_64.dmg) | Intel Mac |\n" if macos else "")

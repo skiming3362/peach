@@ -5150,12 +5150,12 @@ class R2ReleaseTests(unittest.TestCase):
 
 
 class ReleaseDownloadNotesTests(unittest.TestCase):
-    def test_default_download_notes_use_the_github_version_directory(self):
+    def test_default_download_notes_use_the_published_release_directory(self):
         from scripts.package_windows_release import download_notes
+        from peach.release_updates import RELEASES_URL
         links = re.findall(r'https://[^\s)]+', download_notes('1.0.0', lite_installer=True))
         self.assertEqual(len(links), 8)
-        self.assertTrue(all(url.startswith('https://github.com/peach-mitao/peach/releases/download/v1.0.0/')
-                            for url in links))
+        self.assertTrue(all(url.startswith(RELEASES_URL + '/download/v1.0.0/') for url in links))
 
     def test_r2_release_notes_link_both_native_platforms_and_tagged_docs(self):
         from scripts.package_windows_release import download_notes

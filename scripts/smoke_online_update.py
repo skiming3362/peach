@@ -11,6 +11,7 @@ from pathlib import Path
 import socket
 import sqlite3
 import subprocess
+import sys
 import urllib.parse
 import urllib.request
 import zipfile
@@ -18,9 +19,12 @@ import zipfile
 from smoke_desktop import (artifact_processes, complete_first_run, smoke_directory,
                            smoke_environment, stop_tray, wait_for, wait_health)
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from peach.release_updates import REPOSITORY
+
 
 def download_release(opener, root: Path, version: str) -> Path:
-    with opener.open(f"https://api.github.com/repos/peach-mitao/peach/releases/tags/v{version}", timeout=30) as response:
+    with opener.open(f"https://api.github.com/repos/{REPOSITORY}/releases/tags/v{version}", timeout=30) as response:
         release = json.load(response)
     asset = next(asset for asset in release["assets"] if asset["name"] == f"Peach-{version}-windows-x64.zip")
     archive = root / "old.zip"

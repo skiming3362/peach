@@ -14,40 +14,34 @@ import zipfile
 import httpx
 
 from peach import settings_file, standalone_update as update
-from peach import update_packages
+from peach import release_updates, update_packages
 from scripts.package_windows_release import package as package_release
 from scripts.smoke_split_update import verify as verify_split
 from support.ledger import fresh_ledger
 
 
-class ReleaseDownloadFailoverTests(unittest.TestCase):
-    def test_both_sources_fall_back_to_identical_verified_bytes(self):
-        suffix = 'v1.0.0/Peach-1.0.0-windows-x64-update.zip'
-        urls = ('https://github.com/peach-mitao/peach/releases/download/' + suffix,
-                'https://downloads.peach.video/' + suffix)
+class ReleaseDownloadTests(unittest.TestCase):
+    def test_a_download_is_verified_and_left_in_place(self):
+        url = release_updates.RELEASES_URL + '/download/v1.0.0/Peach-1.0.0-windows-x64-update.zip'
         content = b'verified release bytes'
-        for primary in urls:
-            for failure in ('unavailable', 'corrupt'):
-                with self.subTest(primary=primary, failure=failure), tempfile.TemporaryDirectory() as folder:
-                    calls = []
+        calls = []
 
-                    def respond(request, primary=primary, failure=failure, calls=calls):
-                        calls.append(str(request.url))
-                        if str(request.url) == primary:
-                            return httpx.Response(503) if failure == 'unavailable' else httpx.Response(200, content=b'damaged')
-                        return httpx.Response(200, content=content)
+        def respond(request):
+            calls.append(str(request.url))
+            return httpx.Response(200, content=content)
 
-                    def client(respond=respond, **_kwargs):
-                        return httpx.Client(transport=httpx.MockTransport(respond))
+        def client(**_kwargs):
+            return httpx.Client(transport=httpx.MockTransport(respond))
 
-                    archive = Path(folder).resolve() / 'update.zip'
-                    archive.write_bytes(b'previous partial download')
-                    with patch('peach.peach_proxy.http_client', side_effect=client):
-                        update.download(primary, archive, len(content), hashlib.sha256(content).hexdigest(), lambda _count: None)
-                    self.assertEqual(calls, [primary, next(url for url in urls if url != primary)])
-                    self.assertEqual(archive.read_bytes(), content)
+        with tempfile.TemporaryDirectory() as folder:
+            archive = Path(folder).resolve() / 'update.zip'
+            archive.write_bytes(b'previous partial download')
+            with patch('peach.peach_proxy.http_client', side_effect=client):
+                update.download(url, archive, len(content), hashlib.sha256(content).hexdigest(), lambda _count: None)
+            self.assertEqual(calls, [url], '只有一个发布源，地址由发布记录给出')
+            self.assertEqual(archive.read_bytes(), content)
 
-    def test_two_corrupt_sources_cannot_bypass_the_original_digest(self):
+    def test_a_corrupt_source_cannot_bypass_the_original_digest(self):
         calls = []
 
         def respond(request):
@@ -57,11 +51,12 @@ class ReleaseDownloadFailoverTests(unittest.TestCase):
         def client(**_kwargs):
             return httpx.Client(transport=httpx.MockTransport(respond))
 
+        url = release_updates.RELEASES_URL + '/download/v1.0.0/Peach-1.0.0-windows-x64.zip'
         with tempfile.TemporaryDirectory() as folder, patch('peach.peach_proxy.http_client', side_effect=client):
             with self.assertRaisesRegex(ValueError, '校验失败'):
-                update.download('https://github.com/peach-mitao/peach/releases/download/v1.0.0/Peach-1.0.0-windows-x64.zip',
-                                Path(folder).resolve() / 'package.zip', 3, hashlib.sha256(b'yes').hexdigest(), lambda _count: None)
-        self.assertEqual(len(calls), 2)
+                update.download(url, Path(folder).resolve() / 'package.zip', 3,
+                                hashlib.sha256(b'yes').hexdigest(), lambda _count: None)
+        self.assertEqual(calls, [url])
 
 
 class StandaloneUpdateTests(unittest.TestCase):
@@ -294,7 +289,7 @@ class StandaloneUpdateTests(unittest.TestCase):
         archive = output / "Peach-1.0.0-windows-x64-update.zip"
         release = dict(state="available", latest_version="1.0.0", asset_size=archive.stat().st_size,
                        asset_digest="sha256:" + update_packages.digest(archive),
-                       asset_url="https://github.com/peach-mitao/peach/releases/download/v1.0.0/" + archive.name,
+                       asset_url=release_updates.RELEASES_URL + "/download/v1.0.0/" + archive.name,
                        package_kind="update")
         return source, output, manifest, target, archive, release
 
@@ -400,7 +395,7 @@ class StandaloneUpdateTests(unittest.TestCase):
         for bundle in manifest['tools'].values():
             self.assertTrue(update_packages.matches(stage, bundle['files']))
 
-    def prepare_online_lite(self, outcome='github'):
+    def prepare_online_lite(self, outcome='ok'):
         from peach.desktop_installer import prepare_install_tools
         output, manifest, _, stage, error = self.lite_fixture()
         target = self.root / 'fresh-online-install'
@@ -409,14 +404,10 @@ class StandaloneUpdateTests(unittest.TestCase):
 
         def respond(request):
             requests.append(str(request.url))
-            r2 = request.url.host == 'downloads.peach.video'
-            if not r2 and outcome == 'unavailable':
+            if outcome == 'unavailable':
                 return httpx.Response(503)
-            if r2 and outcome == 'github':
-                raise httpx.ConnectError('R2 unavailable', request=request)
             name = request.url.path.rsplit('/', 1)[-1]
-            bad = outcome == 'both-corrupt' or (not r2 and outcome == 'mismatch')
-            return httpx.Response(200, content=b'corrupt' if bad else (output / name).read_bytes())
+            return httpx.Response(200, content=b'corrupt' if outcome == 'corrupt' else (output / name).read_bytes())
 
         with patch('peach.__version__', '1.0.0'), patch.object(update.httpx, 'Client', side_effect=lambda **kwargs:
                 original_client(**{**kwargs, 'transport': httpx.MockTransport(respond), 'trust_env': False, 'proxy': None})):
@@ -424,36 +415,27 @@ class StandaloneUpdateTests(unittest.TestCase):
         self.assertFalse(target.exists())
         return result, requests, manifest, stage, error
 
-    def test_lite_installer_prepares_from_github_with_no_r2_or_adjacent_archives(self):
+    def test_lite_installer_prepares_from_the_single_published_source(self):
         result, requests, manifest, stage, error = self.prepare_online_lite()
         self.assertEqual(result, 0, error.read_text(encoding='utf-8') if error.exists() else '')
         self.assertEqual(len(requests), len(update_packages.TOOL_PATHS))
-        self.assertTrue(all(url.startswith('https://github.com/peach-mitao/peach/releases/download/v1.0.0/') for url in requests))
+        prefix = release_updates.RELEASES_URL + '/download/v1.0.0/'
+        self.assertTrue(all(url.startswith(prefix) for url in requests))
         for bundle in manifest['tools'].values():
             self.assertTrue(update_packages.matches(stage, bundle['files']))
 
-    def test_lite_installer_uses_same_version_r2_when_github_is_unavailable(self):
-        result, requests, manifest, stage, _ = self.prepare_online_lite('unavailable')
-        self.assertEqual(result, 0)
-        self.assertEqual(len(requests), 2 * len(update_packages.TOOL_PATHS))
-        self.assertTrue(all(url.startswith('https://downloads.peach.video/v1.0.0/')
-                            for url in requests[1::2]))
-        for bundle in manifest['tools'].values():
-            self.assertTrue(update_packages.matches(stage, bundle['files']))
-
-    def test_lite_installer_accepts_only_the_embedded_manifest_digest_across_sources(self):
-        result, requests, manifest, stage, _ = self.prepare_online_lite('mismatch')
-        self.assertEqual(result, 0)
-        self.assertEqual(len(requests), 2 * len(update_packages.TOOL_PATHS))
-        for bundle in manifest['tools'].values():
-            self.assertTrue(update_packages.matches(stage, bundle['files']))
-
-    def test_lite_installer_rejects_both_sources_when_their_bytes_do_not_match(self):
-        result, requests, manifest, stage, error = self.prepare_online_lite('both-corrupt')
+    def test_lite_installer_reports_an_unreachable_source_without_retrying(self):
+        result, requests, manifest, stage, error = self.prepare_online_lite('unavailable')
         self.assertEqual(result, 1)
-        self.assertEqual(len(requests), 2)
-        self.assertIn('校验失败', error.read_text(encoding='utf-8'))
+        self.assertEqual(len(requests), 1, '只有一个发布源，取不到就报错')
         self.assertFalse(update_packages.matches(stage, manifest['tools']['ffmpeg']['files']))
+
+    def test_lite_installer_accepts_only_the_embedded_manifest_digest(self):
+        result, requests, manifest, stage, error = self.prepare_online_lite('corrupt')
+        self.assertEqual(result, 1)
+        self.assertIn('校验失败', error.read_text(encoding='utf-8'))
+        for bundle in manifest['tools'].values():
+            self.assertFalse(update_packages.matches(stage, bundle['files']))
 
     def test_lite_installer_rejects_a_corrupt_archive_and_can_retry_without_touching_the_install(self):
         from peach.desktop_installer import prepare_install_tools

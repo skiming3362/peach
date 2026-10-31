@@ -11,12 +11,16 @@ from pathlib import Path
 import socket
 import sqlite3
 import subprocess
+import sys
 import urllib.parse
 import urllib.request
 import zipfile
 
 from smoke_desktop import (artifact_processes, assert_requires_login, complete_first_run,
                            smoke_directory, smoke_environment, stop_tray, wait_for, wait_health)
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from peach.release_updates import REPOSITORY
 
 
 APP_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{02D9748A-78F6-4866-AC75-918177194DAB}_is1"
@@ -38,7 +42,7 @@ def menu_path() -> Path:
 
 def download(opener, root: Path, version: str, kind: str) -> Path:
     request = urllib.request.Request(
-        f"https://api.github.com/repos/peach-mitao/peach/releases/tags/v{version}")
+        f"https://api.github.com/repos/{REPOSITORY}/releases/tags/v{version}")
     if token := os.environ.get("GH_TOKEN"):
         request.add_header("Authorization", f"Bearer {token}")
     with opener.open(request, timeout=30) as response:

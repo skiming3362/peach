@@ -1,4 +1,11 @@
-"""公开测试版查询；传输复用共享 HTTPX，发行包支持 R2 与 GitHub。"""
+"""公开测试版查询；传输复用共享 HTTPX，发行包从 GitHub Releases 取。
+
+这份检出发的是本机自用的修改版，所以更新源指向自己的 fork，不是上游
+`peach-mitao/peach`：上游发新版时本机不该被它带走，只有 fork 上挂出带制品的发布才会被
+检查到。制品由 `scripts/package_windows_release.py` 打，`state/project-context/
+publish-release.ps1` 负责挂到 fork 的 release 上。上游另有 `downloads.peach.video` 这个
+镜像源，fork 没有对应服务，这里不再保留第二个源。
+"""
 from __future__ import annotations
 
 import json
@@ -9,19 +16,14 @@ from . import __version__, distribution
 from .http import HttpRequest, HttpxTransport
 from .update_packages import TOOL_PATHS
 
-RELEASES_URL = "https://github.com/peach-mitao/peach/releases"
-API_URL = "https://api.github.com/repos/peach-mitao/peach/releases?per_page=100"
-DOWNLOADS_BASE = "https://downloads.peach.video"
-DOWNLOADS_API = DOWNLOADS_BASE + "/releases.json"
+#: 更新源的 GitHub 归属。改这一处等于换发布通道：检查、下载地址和发布页链接都跟着变。
+REPOSITORY = "skiming3362/peach"
+RELEASES_URL = f"https://github.com/{REPOSITORY}/releases"
+API_URL = f"https://api.github.com/repos/{REPOSITORY}/releases?per_page=100"
 
 
 def download_sources(url: str) -> tuple[str, ...]:
-    """发行包保留同版本、同文件名的另一公开源；校验沿用原发布摘要。"""
-    github = RELEASES_URL + "/download/"
-    mirror = DOWNLOADS_BASE + "/"
-    for primary, backup in ((github, mirror), (mirror, github)):
-        if url.startswith(primary):
-            return url, backup + url.removeprefix(primary)
+    """发行包的下载地址。只剩 GitHub 一个来源，保留成列表是为了让调用方不必改形状。"""
     return (url,)
 
 
@@ -37,8 +39,13 @@ def _version(value: object) -> tuple[int, ...] | None:
     return tuple(map(int, value.removeprefix("v").split(".")))
 
 
-def _release_candidates(rows: list, endpoint: str) -> list[tuple]:
-    """从一个公开发行源选择完整包，并构造受信任的下载地址。"""
+def _release_candidates(rows: list) -> list[tuple]:
+    """从 GitHub 的发行列表里挑出完整包，并构造受信任的下载地址。
+
+    只认带全套工具包的那一版更新包：缺工具包时只下完整包，靠它补齐工具。下载地址一律
+    由这里按 tag 和资产名拼出来，不采信发行条目里的 `browser_download_url`——那是发布者
+    可以随手填的字段，摘要才是校验依据。
+    """
     releases = []
     for row in rows:
         if not isinstance(row, dict) or row.get("draft"):
@@ -55,14 +62,8 @@ def _release_candidates(rows: list, endpoint: str) -> list[tuple]:
             continue
         complete_tools = all(prefix + f"-tools-{tool}.zip" in uploaded for tool in TOOL_PATHS)
         asset = uploaded.get(prefix + "-update.zip", full) if complete_tools else full
-        if endpoint == DOWNLOADS_API:
-            if not all(re.fullmatch(r"sha256:[0-9a-f]{64}", item.get("digest") or "") for item in (asset, full)):
-                continue
-            directory = f"{DOWNLOADS_BASE}/{tag}"
-        else:
-            directory = f"{RELEASES_URL}/download/{tag}"
-        release_url = f"{RELEASES_URL}/tag/{tag}"
-        releases.append((version, tag, asset, full, directory, release_url))
+        directory = f"{RELEASES_URL}/download/{tag}"
+        releases.append((version, tag, asset, full, directory, f"{RELEASES_URL}/tag/{tag}"))
     return releases
 
 
@@ -70,26 +71,13 @@ def check(*, transport=None) -> dict:
     result = snapshot()
     client = transport or HttpxTransport()
     try:
-        releases = []
-        obtained = False
-        for endpoint in (API_URL, DOWNLOADS_API):
-            try:
-                headers = {"Accept": "application/json"}
-                if endpoint == API_URL:
-                    headers.update(Accept="application/vnd.github+json", **{"X-GitHub-Api-Version": "2022-11-28"})
-                response = client(HttpRequest("GET", endpoint, headers), 12.0, 2_000_000)
-                if response.status != 200:
-                    continue
-                rows = json.loads(response.body)
-                if not isinstance(rows, list):
-                    continue
-                obtained = True
-                releases.extend(_release_candidates(rows, endpoint))
-            except (OSError, ValueError, TypeError, TimeoutError, httpx.HTTPError):
-                continue
+        headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+        response = client(HttpRequest("GET", API_URL, headers), 12.0, 2_000_000)
+        rows = json.loads(response.body) if response.status == 200 else None
+        releases = _release_candidates(rows) if isinstance(rows, list) else []
         if not releases:
-            return dict(result, state="empty" if obtained else "error",
-                        message="暂未找到可下载的测试版。" if obtained else "未能取得版本信息，请重试。")
+            return dict(result, state="empty" if isinstance(rows, list) else "error",
+                        message="暂未找到可下载的测试版。" if isinstance(rows, list) else "未能取得版本信息，请重试。")
         version, tag, asset, full, directory, release_url = max(releases, key=lambda item: item[0])
         current = _version(result["current_version"])
         if current is None:

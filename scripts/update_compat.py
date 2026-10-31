@@ -30,6 +30,8 @@ from peach.update_packages import MANIFEST, SELF_PROVISIONED  # noqa: E402
 OLDEST_CLIENT = "0.48.0"
 
 #: 在旧版本的源码树里执行：只走它自己的检查与清单读取，网络换成本次的发布条目。
+#: 每个请求都回答同一份条目——旧版本的检查可能打它自己的 GitHub 端点，也可能打已经不
+#: 存在了的镜像端点，本文件不该替它挑，反正两处拿到的是同一版发布。
 PROBE = r"""
 import json, sys, tempfile
 from pathlib import Path
@@ -41,9 +43,7 @@ if not Path(peach.__file__).resolve().is_relative_to(Path(sys.argv[1]).resolve()
 from peach import release_updates, update_packages
 payload = json.load(sys.stdin)
 def transport(request, *_):
-    if request.url == release_updates.DOWNLOADS_API:
-        return SimpleNamespace(status=200, headers={}, body=json.dumps(payload["rows"]).encode(), url=request.url)
-    return SimpleNamespace(status=404, headers={}, body=b"", url=request.url)
+    return SimpleNamespace(status=200, headers={}, body=json.dumps(payload["rows"]).encode(), url=request.url)
 release = release_updates.check(transport=transport)
 result = {"state": release.get("state"), "latest": release.get("latest_version"),
           "kind": release.get("package_kind"), "tools": sorted(update_packages.TOOL_PATHS)}
