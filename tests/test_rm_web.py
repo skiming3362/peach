@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
-from peach import catalog_rules, jav_poster_crop, web_batch, web_catalog, web_entity, web_playlists, web_stats
+from peach import catalog_rules, jav_poster_crop, web_batch, web_catalog, web_entity, web_playlists, web_search, web_stats
 from peach import web_contract as rm_web
 from peach.previews import entity_image_key, logo_key
 from peach.web_catalog import q_editions, q_items, q_parts
@@ -25,6 +25,40 @@ from support.ledger import fresh_ledger
 
 
 class WebDataTests(unittest.TestCase):
+    def test_catalog_summary_preserves_filters_without_projecting_cards(self):
+        for filters in ({}, {'loc': '115'}, {'year': '2024'}, {'year': '1900'}):
+            with self.subTest(filters=filters):
+                cards = q_items(self.contract, {**filters, 'limit': '10'})
+                summary = q_items(self.contract, {**filters, 'summary_only': '1', 'count': '0',
+                                                  'offset': '500', 'limit': '1'})
+                self.assertEqual(summary, {key: cards[key] for key in ('total', 'bytes', 'work_total')})
+                self.assertNotIn('items', summary)
+
+    def test_watch_later_rejects_an_asset_deleted_before_submission(self):
+        with self.assertRaisesRegex(ValueError, 'asset not found'):
+            rm_web.w_watch_later(self.contract, {'id': 999999})
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(connection.execute('PRAGMA foreign_key_check').fetchall(), [])
+
+    def test_purge_preserves_follow_item_and_playback_without_a_dangling_asset(self):
+        media = Path(self.tmp.name).resolve() / 'purge-follow.mp4'
+        media.write_bytes(b'temporary media')
+        with self.contract.write_transaction() as connection:
+            connection.execute('UPDATE asset SET path=? WHERE id=1', (str(media),))
+            connection.execute("INSERT INTO follow_source(id,provider,ref,label,url,created_at,updated_at) "
+                               "VALUES(901,'test','author','author','https://example.test/author','now','now')")
+            connection.execute("INSERT INTO follow_item(id,source_id,external_id,title,release_key,asset_id,"
+                               "first_seen_at,last_seen_at) VALUES(901,901,'item','item','item',1,'now','now')")
+            connection.execute("INSERT INTO follow_playback(follow_item_id,profile_id,play_count) "
+                               "VALUES(901,'local-default',3)")
+        row = self.row(1)
+        with self.contract.write_transaction() as connection:
+            web_batch.purge_assets(connection, [row])
+            self.assertIsNone(connection.execute('SELECT id FROM asset WHERE id=1').fetchone())
+            self.assertIsNone(connection.execute('SELECT asset_id FROM follow_item WHERE id=901').fetchone()[0])
+            self.assertEqual(connection.execute('SELECT play_count FROM follow_playback WHERE follow_item_id=901').fetchone()[0], 3)
+            self.assertEqual(connection.execute('PRAGMA foreign_key_check').fetchall(), [])
+
     def test_release_year_filter_and_facets_share_scope_and_keep_other_year_options(self):
         with self.contract.write_transaction() as connection:
             connection.execute("UPDATE asset SET release_date='2024-03-05' WHERE id=1")
@@ -143,6 +177,47 @@ class WebDataTests(unittest.TestCase):
         self.assertEqual(restored["restored_reasons"], {"1": None})
         rm_web.w_batch(self.contract, {"ids": [1], "operation": "dispose", "disposal_reason": None})
         self.assertIsNone(self.row()["disposal_reason"])
+
+    def test_latest_work_is_the_newest_visible_release_of_each_entity(self):
+        """搜索推荐的「最新作」：发行日最晚的可见作品；进了回收站的、没有发行日的不算。"""
+        with closing(sqlite3.connect(self.db_path)) as con, con:
+            con.executemany(
+                "INSERT INTO asset(id,location,path,name,medium,size,code,release_date,disposal,first_seen) "
+                "VALUES(?,'local',?,?,'video',1,?,?,?,'2026-08-15')",
+                [(21, r"R:\\Media\\new.mp4", "new.mp4", "ABC-009", "2026-05-01", None),
+                 (22, r"R:\\Media\\gone.mp4", "gone.mp4", "ABC-010", "2026-07-01", "trash"),
+                 (23, r"R:\\Media\\bare.mp4", "bare.mp4", "ABC-011", None, None)])
+            con.execute("UPDATE asset SET release_date='2025-01-02' WHERE id=1")
+            con.executemany("INSERT INTO asset_entity(asset_id,entity_id,role,source,confidence) "
+                            "VALUES(?,11,'performer','test',1.0)", [(21,), (22,), (23,)])
+        latest = rm_web.dispatch_api_get(self.contract, "/api/entity/latest", {"ids": "11,12,13,x"})["items"]
+        self.assertEqual(latest["11"], {"id": 21, "code": "ABC-009", "release_date": "2026-05-01"})
+        # 厂牌 13 也挂在 1 号上；没问到的 10 号标签不在结果里。
+        self.assertEqual(latest["13"], {"id": 1, "code": "ABC-001", "release_date": "2025-01-02"})
+        self.assertEqual(sorted(latest), ["11", "12", "13"])
+        self.assertEqual(rm_web.dispatch_api_get(self.contract, "/api/entity/latest", {})["items"], {})
+
+    def test_search_recommendations_bundle_every_group_in_one_read(self):
+        """搜索推荐一个请求取齐五份：作品照 `/api/items` 的口径，关注那份不带推荐栏用不上的筛选项，
+        占位推荐词取自馆藏作品的番号与署名。"""
+        bundle = rm_web.dispatch_api_get(self.contract, "/api/search/recommendations", {})
+        self.assertEqual(set(bundle), {"items", "jav", "follow", "feeds", "authors", "latest", "words"})
+        self.assertEqual({row["id"] for row in bundle["items"]["items"]}, {1, 2})
+        if bundle["follow"] is not None:
+            self.assertNotIn("facets", bundle["follow"])
+        self.assertIn("ABC-001", bundle["words"])
+        self.assertTrue(all(len(word) > 1 for word in bundle["words"]))
+
+    def test_search_recommendations_reuse_one_pool_across_page_opens(self):
+        """每开一页都预取推荐：池子复用，不在每次预取时重算；换的只是池里的顺序。
+        后台任务每几秒提交一次，提交通知也不清掉这一池。"""
+        first = rm_web.dispatch_api_get(self.contract, "/api/search/recommendations", {})
+        self.contract.cache_bust()
+        with mock.patch.object(web_search, "q_items", side_effect=AssertionError("推荐池被重算了")):
+            again = rm_web.dispatch_api_get(self.contract, "/api/search/recommendations", {})
+        self.assertEqual({row["id"] for row in again["items"]["items"]},
+                         {row["id"] for row in first["items"]["items"]})
+        self.assertEqual(sorted(again["words"]), sorted(first["words"]))
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -263,12 +338,12 @@ class WebDataTests(unittest.TestCase):
 
         calls = 0
 
-        def counted_extra(name, path, **kwargs):
+        def counted_extra(name, path, roots):
             nonlocal calls
             calls += 1
-            return catalog_rules.is_local_extra(name, path, **kwargs)
+            return catalog_rules.is_local_extra(name, path, library_roots=roots)
 
-        with mock.patch("peach.repository.is_local_extra", counted_extra):
+        with mock.patch("peach.repository.sql_is_local_extra", counted_extra):
             actual = rm_web.q_facets(self.contract, filters=filters)
         # 工作量断言不依赖机器执行速度。
         self.assertLess(calls, asset_count * 40, f"asset predicate calls: {calls}")
@@ -280,6 +355,53 @@ class WebDataTests(unittest.TestCase):
                     self.assertEqual(actual[key], expected[key])
         self.assertEqual(next(row["n"] for row in actual["tagperformers"]
                               if row["k"] == "Demo performer 0"), 20)
+
+    def test_entity_shapes_bound_asset_predicate_work_with_inaccurate_statistics(self):
+        asset_count, people_count = 400, 80
+        with self.contract.write_transaction() as connection:
+            connection.executemany(
+                "INSERT INTO asset(id,location,path,name,medium,size) VALUES(?,'local',?,?,'video',1)",
+                [(1000 + i, f'R:/Media/shape-{i}.mp4', f'shape-{i}.mp4') for i in range(asset_count)])
+            connection.executemany(
+                "INSERT INTO entity(id,kind,canonical_name,normalized_name,created_at,updated_at) "
+                "VALUES(?,'performer',?,?,'2026-01-01','2026-01-01')",
+                [(2000 + i, f'Shape person {i}', f'shape person {i}') for i in range(people_count)])
+            connection.executemany(
+                "INSERT INTO asset_entity(asset_id,entity_id,role,source) VALUES(?,?,'performer','test')",
+                [(1000 + i, 2000 + (i + offset) % people_count)
+                 for i in range(asset_count) for offset in (0, 1)])
+            connection.execute('ANALYZE')
+        with self.contract.read_connection() as connection:
+            expected = web_entity._entity_shape_parts(self.contract, connection)
+        with self.contract.write_transaction() as connection:
+            if connection.execute("SELECT 1 FROM sqlite_schema WHERE name='sqlite_stat4'").fetchone():
+                connection.execute('DELETE FROM sqlite_stat4')
+            connection.executemany('UPDATE sqlite_stat1 SET stat=? WHERE idx=?', [
+                ('30000 1500', 'idx_asset_location'),
+                ('30000 1500 1', 'sqlite_autoindex_asset_1'),
+                ('0 0', 'idx_asset_region'),
+                ('1 1 1', 'idx_asset_disposal_id'),
+                ('30000 1', 'idx_asset_name'),
+                ('30000 2', 'idx_asset_size'),
+                ('30000 1500 1500', 'idx_asset_hash'),
+                ('90000 250 250', 'idx_asset_entity_entity_role'),
+                ('90000 10 1 1 1', 'sqlite_autoindex_asset_entity_1'),
+                ('2500 400 1', 'sqlite_autoindex_entity_1'),
+            ])
+        calls = 0
+        def counted_extra(name, path, roots):
+            nonlocal calls
+            calls += 1
+            return catalog_rules.sql_is_local_extra(name, path, roots)
+        with mock.patch('peach.repository.sql_is_local_extra', counted_extra):
+            with self.contract.read_connection() as connection:
+                actual = web_entity._entity_shape_parts(self.contract, connection)
+                self.assertEqual(actual, expected)
+                self.assertLess(calls, asset_count * 10, f'asset predicate calls: {calls}')
+                calls = 0
+                single = web_entity._entity_shape_parts(self.contract, connection, 2000)
+                self.assertEqual(single, {2000: expected[2000]})
+                self.assertLess(calls, 50, f'single-entity predicate calls: {calls}')
 
     def test_facets_ignore_unused_tag_match_and_keep_revision_invalidation(self):
         args = {"loc": "local,115", "thumb": "0", "tag_match": "all"}
@@ -1516,12 +1638,15 @@ class WebDataTests(unittest.TestCase):
             "/api/media-processing",
             "/api/thumbnail-jobs", "/api/timeline", "/api/media-repair",
             "/api/scraping", "/api/scraping/cover", "/api/scraping/amane-bridge",
-            "/api/items", "/api/item", "/api/entity", "/api/entity/shapes", "/api/photos", "/api/photo-set",
+            "/api/scraping/check-all",
+            "/api/items", "/api/item", "/api/entity", "/api/entity/shapes", "/api/entity/latest", "/api/photos", "/api/photo-set",
             "/api/index", "/api/parts", "/api/editions", "/api/duplicates", "/api/quality-goals",
             "/api/stats", "/api/tops", "/api/ads", "/api/related", "/api/facets",
             "/api/suggest",
-            "/api/search-history", "/api/review", "/api/playlists", "/api/playlist",
+            "/api/search-history", "/api/search/recommendations", "/api/review", "/api/review/auto-landings",
+            "/api/playlists", "/api/playlist",
             "/api/post-setup-tutorial",
+            "/api/tutorial-progress", "/api/performer/delete-candidates", "/api/performer/delete-plan",
             "/api/library-shortcuts", "/api/folders",
             "/api/custom-metadata",
             "/api/follow", "/api/follow/credentials", "/api/follow/schedule",
@@ -1534,22 +1659,26 @@ class WebDataTests(unittest.TestCase):
             "/api/feeds/schedule",
             "/api/downloads", "/api/resources/search",
             "/api/wants", "/api/wants/magnets",
-            "/api/jav/detail", "/api/jav/reviews", "/api/jav/resources", "/api/jav/discoveries",
+            "/api/jav/detail", "/api/jav/reviews", "/api/jav/resources", "/api/jav/discoveries", "/api/jav/releases",
+            "/api/jav/discoveries/metadata",
+            "/api/result-updates",
         })
         self.assertEqual(set(rm_web.POST_HANDLERS), {
             "/api/tag-management", "/api/tag-management/preview", "/api/follow/tag",
             "/api/downloads", "/api/downloads/cancel", "/api/downloads/postprocess",
             "/api/library-processing", "/api/thumbnail-jobs", "/api/media-repair",
             "/api/media-processing",
-            "/api/scraping/settings", "/api/scraping/check", "/api/scraping/cover",
+            "/api/scraping/settings", "/api/scraping/check", "/api/scraping/check-all",
+            "/api/scraping/cover", "/api/jav/cover", "/api/jav/discoveries/metadata", "/api/jav/releases/metadata",
             "/api/scraping/amane-bridge/check", "/api/scraping/amane-bridge/rebuild",
             "/api/activity", "/api/play", "/api/feedback", "/api/watch-later",
             "/api/playlist",
+            "/api/tutorial-progress", "/api/performer/delete",
             "/api/library-shortcuts", "/api/folders/preview", "/api/folders/rule",
             "/api/custom-metadata",
             "/api/preference", "/api/quality-goal", "/api/item-tag", "/api/batch",
             "/api/search-history", "/api/trash/empty",
-            "/api/review/decision", "/api/review/genre",
+            "/api/review/decision", "/api/review/genre", "/api/review/auto-landings/revert",
             "/api/purge-missing", "/api/orphan-records/attach",
             "/api/links/check", "/api/links/prune",
             "/api/resource-sync/scan", "/api/resource-sync/apply",
@@ -1682,7 +1811,7 @@ class WebDataTests(unittest.TestCase):
         con.commit(); con.close()
         groups = rm_web._edition_groups(self.contract, ["ABF-234"])
         self.assertEqual(list(groups), ["ABF-234"])
-        self.assertEqual([item["edition"] for item in groups["ABF-234"]], ["有码", "无码"])
+        self.assertEqual([item["edition"] for item in groups["ABF-234"]], ["有码", "无码破解"])
         # 正片在前只是要一个稳定的锚点：次序一变，卡片标题就跟着换。
         self.assertEqual(groups["ABF-234"][0]["id"], 9001)
 
@@ -1984,6 +2113,88 @@ class WebDataTests(unittest.TestCase):
         self.assertTrue(kept.exists(), "不在回收站的媒体一个都不能碰")
         self.assertIsNotNone(self.row(2))
 
+    def test_empty_trash_moves_media_outside_the_write_lock_and_spares_rows_restored_meanwhile(self):
+        """网盘上逐个 stat、改名不占写锁；这期间被还原出回收站的，事务里复核时留下、文件放回原处。"""
+        binned = self.stage_media(1, "binned.mp4")
+        restored = self.stage_media(2, "restored.mp4")
+        rm_web.w_feedback(self.contract, {"id": 1, "kind": "dispose"})
+        rm_web.w_feedback(self.contract, {"id": 2, "kind": "dispose"})
+        quarantine = web_batch._quarantine_media
+        locked = []
+
+        def outside_lock(original, **kwargs):
+            locked.append(self.contract.database.write_lock.locked())
+            moved = quarantine(original, **kwargs)
+            if original == restored and not locked[-1]:
+                rm_web.w_feedback(self.contract, {"id": 2, "kind": "dispose"})
+            return moved
+        with mock.patch.object(web_batch, "_quarantine_media", side_effect=outside_lock):
+            result = rm_web.w_empty_trash(self.contract)
+
+        self.assertEqual(locked, [False, False])
+        self.assertEqual(result["purged"], 1)
+        self.assertEqual([item["id"] for item in result["blocked"]], [2])
+        self.assertFalse(binned.exists())
+        self.assertIsNone(self.row(1))
+        self.assertTrue(restored.is_file(), "隔离期间被还原的，文件放回原处")
+        self.assertIsNone(self.row(2)["disposal"])
+
+    def test_a_purge_cleans_only_what_the_deleted_rows_left_behind(self):
+        """删完不再把整个派生目录扫一遍：只清这几部留下的产物，别的孤儿留给资源同步那一轮。"""
+        self.stage_media(1, "binned.mp4")
+        root = Path(self.tmp.name).resolve()
+        transcodes, streams = root / "transcodes", root / "stream-segments"
+        (streams / "1" / "v").mkdir(parents=True)
+        transcodes.mkdir()
+        mine, segment, stranger = transcodes / "1-5-6.mp4", streams / "1" / "v" / "0.ts", transcodes / "999-5-6.mp4"
+        for path in (mine, segment, stranger):
+            path.write_bytes(b"cache")
+        self.contract.transcode_root, self.contract.stream_root = transcodes, streams
+        self.contract.resource_cleanup_enabled = True
+        rm_web.w_feedback(self.contract, {"id": 1, "kind": "dispose"})
+
+        result = rm_web.w_empty_trash(self.contract)
+
+        self.assertEqual((result["purged"], result["cache_removed"]), (1, 2))
+        self.assertFalse(mine.exists())
+        self.assertFalse((streams / "1").exists())
+        self.assertTrue(stranger.is_file(), "别的孤儿留给资源同步那一轮")
+
+    def test_empty_trash_withdraws_candidates_and_decisions_pinned_to_purged_assets(self):
+        # #486：删掉的资产留下的候选与决定，之后同一路径重新登记拿到新编号时就悬空了。
+        from peach.library_processing import FIELDS
+        from peach.review_csv import read_rows, write_rows
+        binned = self.stage_media(1, "binned.mp4")
+        candidates = Path(self.tmp.name).resolve() / "generated"
+        output = candidates / "library-metadata-field-candidates.csv"
+
+        def row(asset_id, field, path):
+            return {"item_key": f"asset:{asset_id}:{field}", "code": "ABC-001", "query": "ABC-001",
+                    "asset_id": asset_id, "asset_path": path, "field": field, "status": "candidate",
+                    "candidates_json": "[]"}
+        write_rows(output, FIELDS, [row(1, "title", str(binned)), row(1, "studio", str(binned)),
+                                    row(2, "title", r"B:\two.mp4"),
+                                    {**row("", "series", ""), "item_key": "code:ABC-001:series"}],
+                   fill_missing=True)
+        with self.contract.write_transaction() as connection:
+            connection.executemany(
+                "INSERT INTO review_decision(category,item_key,status,updated_at) VALUES(?,?,'skipped','now')",
+                [("metadata_fields", "asset:1:title"), ("metadata_fields", "asset:2:title"),
+                 ("metadata_fields", "asset:11:title"), ("creator_tags", "asset:1:title")])
+        contract = rm_web.WebContract(Path(self.db_path), avatar_root=self.avatars, logo_root=self.logos,
+                                      candidate_root=candidates)
+        rm_web.w_feedback(contract, {"id": 1, "kind": "dispose"})
+
+        self.assertEqual(rm_web.w_empty_trash(contract)["purged"], 1)
+
+        self.assertEqual([candidate["item_key"] for candidate in read_rows(output)],
+                         ["asset:2:title", "code:ABC-001:series"])
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT category,item_key FROM review_decision ORDER BY category,item_key").fetchall(),
+                [("creator_tags", "asset:1:title"), ("metadata_fields", "asset:11:title"),
+                 ("metadata_fields", "asset:2:title")])
+
     def test_rclone_mount_detection_uses_the_most_specific_mountpoint(self):
         mountinfo = Path(self.tmp.name) / "mountinfo"
         mountinfo.write_text(
@@ -2133,6 +2344,27 @@ class WebDataTests(unittest.TestCase):
         self.assertEqual(self.row(1)["disposal"], "trash")
         with self.assertRaises(ValueError):
             rm_web.w_batch(self.contract, {"ids": list(range(201)), "operation": "seen"})
+
+    def test_related_reason_names_shared_tags_the_user_can_see(self):
+        con = sqlite3.connect(self.db_path)
+        con.execute("INSERT INTO entity(id,kind,canonical_name,normalized_name,created_at,updated_at) "
+                    "VALUES(14,'tag','痴女','痴女','2026-01-01','2026-01-01')")
+        con.executemany("INSERT INTO asset_tag(asset_id,tag,source) VALUES(?,?,?)",
+                        [(1, "痴女", "name"), (2, "足交", "name"), (2, "痴女", "name")])
+        con.executemany("INSERT INTO asset_entity(asset_id,entity_id,role,source,confidence) "
+                        "VALUES(?,?,'tag','test',1.0)", [(1, 14), (2, 10), (2, 14)])
+        con.commit()
+        con.close()
+
+        first = rm_web.q_related(self.contract, 1, 10)["items"][0]
+        self.assertEqual((first["why"], first["why_tags"]), ("同创作者", ["足交", "痴女"]))
+        # 用户在对面那部上隐藏的标签不拿来当理由；一个都不剩时退回「标签接近」。
+        rm_web.w_item_tag(self.contract, {"id": 2, "operation": "remove", "tag": "足交"})
+        first = rm_web.q_related(self.contract, 1, 10)["items"][0]
+        self.assertEqual(first["why_tags"], ["痴女"])
+        rm_web.w_item_tag(self.contract, {"id": 2, "operation": "remove", "tag": "痴女"})
+        first = rm_web.q_related(self.contract, 1, 10)["items"][0]
+        self.assertEqual((first["why"], "why_tags" in first), ("同创作者 · 标签接近", False))
 
     def test_top_lists_and_related_items_use_canonical_entities(self):
         tops = rm_web.q_tops(self.contract, 10)
@@ -2911,7 +3143,8 @@ class JavModeAndCoverTests(unittest.TestCase):
         })
         self.assertEqual(advertised["display_title"], "")
         self.assertEqual(uncensored["display_title"], "Hinata Mio")
-        self.assertEqual(uncensored["edition_badges"], ["无码"])
+        # 有码片商的番号上，`Uncen` 说的是破解版。
+        self.assertEqual(uncensored["edition_badges"], ["无码破解"])
         self.assertEqual(cracked["edition_badges"], ["无码破解"])
 
     def test_uncensored_release_names_are_not_shown_as_titles(self):
@@ -2985,12 +3218,63 @@ class JavModeAndCoverTests(unittest.TestCase):
             self.assertEqual(row["display_title"], "", name)
             self.assertEqual(row["edition_badges"], ["中字"], name)
         # `-UN` 和 `-U`／`-UC` 是同一个意思；标题判空后不认它就等于丢掉这条信息。
+        # 有码片商的番号上，它说的是破解版。
         self.assertEqual(
             rm_web.jav_display_metadata("ABF-158-UN.mp4", "ABF-158")["edition_badges"],
-            ["无码"])
+            ["无码破解"])
         # 相邻字母不能被当成版次标记吞掉。
         self.assertEqual(
             rm_web.jav_display_metadata("ABC-123CHAPTER.mp4", "ABC-123")["edition_badges"], [])
+
+    def test_uncensored_editions_split_into_native_leaked_and_cracked(self):
+        """无码片商的片是无码，明写流出的是流出，有码番号上其余的无码标记都是破解。"""
+        badges = catalog_rules.jav_edition_badges
+        for name, code, tags, expected in (
+            ("SSIS-698-UC.mp4", "SSIS-698", (), ["无码破解"]),
+            ("www.98T.la@ABW-358-U.mp4", "ABW-358", (), ["无码破解"]),
+            ("300MIUM-123-U.mp4", "300MIUM-123", (), ["无码破解"]),
+            ("ABP-123.mp4", "ABP-123", ("无码",), ["无码破解"]),
+            # `-C-U` 整个是破解标记，不另算中字；`-UMR` 同理。
+            ("ABP-123-C-U.mp4", "ABP-123", (), ["无码破解"]),
+            ("ABP-123-UMR.mp4", "ABP-123", (), ["无码破解"]),
+            ("STARS-141 UNCENSORED leaked 演员名.mp4", "STARS-141", (), ["无码流出"]),
+            ("STARS-160_UNCENSORED_Leaked.mp4", "STARS-160", (), ["无码流出"]),
+            ("ABP-123-流出.mp4", "ABP-123", (), ["无码流出"]),
+            # 无码片商与 FC2 这类本身可能无码的片，`-U` 不改成破解。
+            ("SMBD-120-U.mp4", "SMBD-120", (), ["无码"]),
+            ("010124-001-carib.mp4", "010124-001", (), ["无码"]),
+            ("FC2-PPV-1234567-U.mp4", "FC2-PPV-1234567", (), ["无码"]),
+            ("FC2-PPV-1234567.mp4", "FC2-PPV-1234567", ("无码",), ["无码"]),
+        ):
+            self.assertEqual(badges(name, code, tags), expected, name)
+
+    def test_download_source_names_supply_edition_evidence_the_filename_lost(self):
+        """网盘离线下载的文件名只剩番号，`ch`、「中文字幕」留在种子名或任务名上。"""
+        badges = catalog_rules.jav_edition_badges
+        self.assertEqual(badges("SONE-804 作品标题.mp4", "SONE-804", (),
+                                ("+++ [FHDC] SONE-804 作品标题", "SONE-804ch")), ["中字"])
+        self.assertEqual(badges("ABP-123.mp4", "ABP-123", (), ("ABP-123 中文字幕",)), ["中字"])
+        self.assertEqual(badges("ABP-123.mp4", "ABP-123", (), ("ABP-123-U",)), ["无码破解"])
+        # 磁力名与任务名各给一半证据时取并集，不看先后。
+        self.assertEqual(badges("ABP-123.mp4", "ABP-123", (), ("ABP-123-U", "ABP-123 无码破解")),
+                         ["无码破解"])
+        # 没有下载任务就没有来源名，结果与只看文件名相同。
+        self.assertEqual(badges("ABP-123.mp4", "ABP-123", (), ()), [])
+        # 种子名是另一部片的标记，不能借来：番号对不上就不算这部的版次。
+        self.assertEqual(badges("ABP-123.mp4", "ABP-123", (), ("ABP-999-C",)), [])
+
+    def test_filename_wins_when_it_and_the_download_source_disagree(self):
+        badges = catalog_rules.jav_edition_badges
+        # 文件名只有泛泛的 `-U` 时，种子名里明说的流出压过它；文件名明说了的，种子名改不动。
+        self.assertEqual(badges("ABP-123-U.mp4", "ABP-123", (), ("ABP-123 流出",)), ["无码流出"])
+        self.assertEqual(badges("ABP-123-LTX.mp4", "ABP-123", (), ("ABP-123 流出",)), ["无码破解"])
+        self.assertEqual(badges("ABP-123.mp4", "ABP-123", ["AI去码"], ("ABP-123-U",)),
+                         ["无码破解"])
+        # 无码片商的番号本身就是文件侧证据，种子名上的「破解」不覆盖它，但中字照样补。
+        self.assertEqual(badges("040221-001.mp4", "040221-001", (),
+                                ("040221-001 破解 中文字幕",)), ["中字", "无码"])
+        # 中字只有「有」一个方向：文件名有、种子名没有，不算矛盾。
+        self.assertEqual(badges("ABP-123-C.mp4", "ABP-123", (), ("ABP-123",)), ["中字"])
 
     def test_release_sort_orders_official_dates_descending_and_missing_last(self):
         rows = rm_web.q_items(
@@ -3516,6 +3800,30 @@ class DuplicateDetectionTests(unittest.TestCase):
         self.assertTrue(group["cross_drive"])
         self.assertEqual(group["drives"], ["A:", "B:"])
 
+    def test_kept_group_leaves_the_list_until_its_members_change(self):
+        first = self.add("SSIS-057", 7200, 5_000_000_000, drive="A")
+        second = self.add("SSIS-057", 7200, 4_000_000_000, drive="B")
+        other = [self.add("ABW-232", 7200, 5_000_000_000), self.add("ABW-232", 7200, 3_000_000_000)]
+        rm_web.w_batch(self.contract, {"ids": [second, first], "operation": "keep-duplicates"})
+        result = self.groups()
+        self.assertEqual([group["code"] for group in result["groups"]], ["ABW-232"])
+        self.assertEqual((result["total"], result["files"], result["kept"]), (1, 2, 1),
+                         "标过都保留的组不计入组数、文件数与可回收")
+        self.assertEqual(result["reclaimable"], 3_000_000_000)
+
+        third = self.add("SSIS-057", 7200, 3_000_000_000, drive="C")
+        result = self.groups()
+        self.assertEqual(result["kept"], 0, "多出一份副本，这组要重新列出")
+        regrouped = next(group for group in result["groups"] if group["code"] == "SSIS-057")
+        self.assertEqual({item["id"] for item in regrouped["files"]}, {first, second, third})
+
+        rm_web.w_batch(self.contract, {"ids": [first, second, third], "operation": "keep-duplicates"})
+        self.assertEqual(self.groups()["kept"], 1)
+        rm_web.w_batch(self.contract, {"ids": [first, second, third], "operation": "reconsider-duplicates"})
+        self.assertEqual(self.groups()["total"], 2, "撤销后这组回到列表")
+        with self.assertRaises(ValueError):
+            rm_web.w_batch(self.contract, {"ids": other[:1], "operation": "keep-duplicates"})
+
     def test_duplicate_rows_keep_the_full_path_for_review(self):
         self.add("SSIS-057", 7200, 5_000_000_000, drive="A")
         self.add("SSIS-057", 7200, 4_000_000_000, drive="B")
@@ -3934,14 +4242,14 @@ class TopsRotationTests(unittest.TestCase):
             with self.subTest(**scope):
                 calls = 0
 
-                def counted_extra(name, path, **kwargs):
+                def counted_extra(name, path, roots):
                     nonlocal calls
                     calls += 1
-                    return catalog_rules.is_local_extra(name, path, **kwargs)
+                    return catalog_rules.is_local_extra(name, path, library_roots=roots)
 
                 # 新契约使用冷缓存和新连接，确保执行的是修改统计后的查询。
                 contract = rm_web.WebContract(Path(self.db_path), **roots)
-                with mock.patch('peach.repository.is_local_extra', counted_extra):
+                with mock.patch('peach.repository.sql_is_local_extra', counted_extra):
                     actual = rm_web.q_tops(contract, 8, seed='111', **scope)
                 self.assertTrue(wanted['performers'])
                 self.assertGreater(calls, 0)
@@ -4261,6 +4569,76 @@ class CatalogVersionTests(unittest.TestCase):
         self.assertEqual([row['id'] for row in q_parts(self.contract, {'id': 2})['items']], [1, 2])
         with closing(sqlite3.connect(self.db)) as connection:
             self.assertEqual(connection.execute('SELECT code FROM asset ORDER BY id').fetchall(), [(None,), (None,)])
+
+
+class DownloadSourceEditionTests(unittest.TestCase):
+    """云下载入库的文件名只剩番号时，版次徽章与版次分组读种子名补证据，不写账本。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name).resolve()
+        self.db = fresh_ledger(root)
+        self.contract = rm_web.WebContract(self.db, cover_root=root / "covers")
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.executemany(
+                "INSERT INTO asset(id,location,path,name,medium,code,studio,size,duration,width,height,"
+                "first_seen) VALUES(?,'115',?,?,'video',?,'Studio A',1000000,7200,1920,1080,'2026-01-01')",
+                [(1, r"B:\云下载\SONE-804ch\SONE-804 作品标题.mp4", "SONE-804 作品标题.mp4", "SONE-804"),
+                 (2, r"R:\media\SONE-804.mp4", "SONE-804.mp4", "SONE-804"),
+                 (3, r"B:\云下载\ABP-123\ABP-123-U.mp4", "ABP-123-U.mp4", "ABP-123")])
+
+    def bind(self, task_id, asset_id, display_name, remote_name):
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute(
+                "INSERT INTO download_task(id,provider,source_uri,display_name,target,state,"
+                "remote_name,asset_id,updated_at) VALUES(?,'115','magnet:?xt=urn:btih:x',?,"
+                "'/云下载','ingested',?,?,'2026-11-04T00:00:00Z')",
+                (task_id, display_name, remote_name, asset_id))
+
+    def badges(self, asset_id):
+        return rm_web.q_item(self.contract, asset_id)["edition_badges"]
+
+    def test_list_detail_and_edition_group_read_the_torrent_name(self):
+        self.bind(1, 1, "+++ [FHDC] SONE-804 作品标题", "SONE-804ch")
+        listed = {row["id"]: row for row in q_items(self.contract, {"limit": "20"})["items"]}
+        self.assertEqual(listed[1]["edition_badges"], ["中字"])
+        self.assertEqual(listed[2]["edition_badges"], [])
+        self.assertEqual(self.badges(1), ["中字"])
+        versions = q_editions(self.contract, {"id": 2})
+        self.assertEqual({row["id"]: row["edition_label"] for row in versions["items"]},
+                         {1: "中字 · 1080p", 2: "有码 · 1080p"})
+        with closing(sqlite3.connect(self.db)) as connection:
+            # 只是投影：文件名、标签都没被改写。
+            self.assertEqual(connection.execute("SELECT name FROM asset WHERE id=1").fetchone()[0],
+                             "SONE-804 作品标题.mp4")
+            self.assertEqual(connection.execute("SELECT count(*) FROM asset_entity").fetchone()[0], 0)
+
+    def test_torrent_name_settles_a_bare_uncensored_marker(self):
+        # 文件名只有 `-U`，有码番号上默认是破解；种子名明说流出时听种子名的。
+        self.assertEqual(self.badges(3), ["无码破解"])
+        self.bind(1, 3, "ABP-123 流出", "ABP-123 流出")
+        self.assertEqual(self.badges(3), ["无码流出"])
+
+    def test_assets_without_a_download_task_keep_filename_badges(self):
+        self.bind(1, None, "SONE-804-C", "SONE-804-C")
+        self.assertEqual(self.badges(1), [])
+        self.assertEqual(self.badges(2), [])
+        self.assertEqual(q_editions(self.contract, {"id": 2}), {"error": "edition group not found"})
+
+    def test_binding_a_download_refreshes_the_edition_group_but_polling_does_not_rebuild_it(self):
+        self.bind(1, None, "SONE-804-C", "SONE-804ch")
+        self.assertEqual(q_editions(self.contract, {"id": 2}), {"error": "edition group not found"})
+        with mock.patch.object(web_catalog, "_read_group_rows",
+                               wraps=web_catalog._read_group_rows) as read:
+            with closing(sqlite3.connect(self.db)) as connection, connection:
+                connection.execute("UPDATE download_task SET checks=checks+1 WHERE id=1")
+            web_catalog._catalog_group_rows(self.contract)
+            self.assertEqual(read.call_count, 0)
+            with closing(sqlite3.connect(self.db)) as connection, connection:
+                connection.execute("UPDATE download_task SET asset_id=1 WHERE id=1")
+            self.assertEqual(q_editions(self.contract, {"id": 2})["count"], 2)
+            self.assertEqual(read.call_count, 1)
 
 
 if __name__ == "__main__":

@@ -52,7 +52,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: astral-sh/setup-uv@v10.3.2
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -63,6 +63,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || github.sha }}
         run: uv run --locked --python 3.14 scripts/ci_plan.py --event "$EVENT_NAME" --base "$BASE_SHA"
+      - name: 导出内容与验证计划
+        run: uv run --locked --python 3.14 scripts/ci_test_evidence.py --base '${{ steps.plan.outputs.base }}' --wide '${{ steps.plan.outputs.wide }}' --destination build/ci-proof.json
+      - uses: actions/upload-artifact@v7
+        with:
+          name: test-proof-${{ github.run_attempt }}
+          path: build/ci-proof.json
+          retention-days: 2
 
   frontend-ready:
     name: 前端检查结果
@@ -88,7 +95,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.14'
-      - uses: astral-sh/setup-uv@v10.3.2
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -146,7 +153,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           check-latest: true
-      - uses: astral-sh/setup-uv@v10.3.2
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
@@ -266,7 +273,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.14'
-      - uses: astral-sh/setup-uv@v10.3.2
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock

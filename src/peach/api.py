@@ -35,7 +35,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.datastructures import MutableHeaders
 from starlette.middleware.gzip import DEFAULT_EXCLUDED_CONTENT_TYPES, GZipMiddleware
 
-from . import (__version__, browser_transport, feeds, tunnel, web_contract,
+from . import (__version__, browser_transport, distribution, feeds, ledger_backups, tunnel, web_contract,
                web_feeds, web_follow, web_settings)
 from . import routes_api, routes_auth, routes_configuration, routes_jav_browser, routes_media, routes_pages, routes_subtitles
 from .buildinfo import frozen_build
@@ -73,12 +73,13 @@ from .previews import (
 from .follow_secrets import credential_store_for
 from .push_discovery import PushDiscoveryService
 from .web_downloads import build_download_service
+from .web_local_access import local_client
 from .sample_images import SampleCache
 from .sample_images import cache_root as sample_cache_root
 from .providers import OpenCodeGoClient, default_registry
 from .repository import LedgerDatabase, LedgerRepository
 from .review_mirror import ReviewMirror
-from .routes_auth import AssetLoginRequired, PageLoginRequired
+from .routes_auth import FIRST_ACCESS_DENIED, AssetLoginRequired, PageLoginRequired
 # 两档缓存时长的实现在 `routes_media`，这里再导出：它们是对外的缓存契约，
 # tests/test_follow_web.py 按 `api.MEDIA_CACHE_SECONDS` 断言两者的关系。
 from .routes_media import AVATAR_CACHE_SECONDS, MEDIA_CACHE_SECONDS  # noqa: F401
@@ -142,6 +143,30 @@ class ResponseHeadersMiddleware:
         await self.app(scope, receive, send_headers)
 
 
+class FirstSetupSourceMiddleware:
+    """Docker 首次设置完成前，服务没有口令也没有访问策略，谁连得上谁就能调接口（ADR-0149）。
+
+    这段时间 `/api/` 与写请求只收 `local_client` 认的来源：本机或私有网络、不带代理转发头。
+    页面壳与静态资源照常给，来源不满足的浏览器也能看到首次设置页上那句说明。配置完成后
+    服务换成正常模式，由口令与访问策略把关，这一层不再起作用。
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and distribution.docker():
+            request = Request(scope)
+            settings = request.app.state.settings
+            if (not settings.configured
+                    and (scope["path"].startswith("/api/") or scope["method"] not in {"GET", "HEAD"})
+                    and not local_client(request)):
+                response = JSONResponse({"error": FIRST_ACCESS_DENIED, "docker": True}, status_code=403)
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
 #: Starlette 自己抛的那几种 HTTPException 带的是英文 detail，给人看之前换成中文。
 _DEFAULT_DETAILS = {
     "Not Found": "这个地址下没有页面。",
@@ -200,13 +225,21 @@ def _restore_task_center(contract) -> None:
 
 #: 开机在后台先算一遍的聚合：口味、复核、垃圾复核、关注的全部条目与筛选项各要几秒到
 #: 十几秒，都按账本版本号缓存（`WebContract.cached_until_changed`），算好一次就一直用到
-#: 账本或文件真的变了。
-WARM_AGGREGATES = (("/api/taste", {"window": "all"}), ("/api/review", {}), ("/api/ads", {}),
+#: 账本或文件真的变了。排在前面的是每页都碰到的几份：形状名单、作品分组快照（目录、
+#: 索引、筛选项都建在它上面）、统计与搜索推荐池，重启后第一个打开页面的人不再等它们一起冷算。
+WARM_AGGREGATES = (("/api/entity/shapes", {}), ("/api/items", {"limit": "60"}), ("/api/stats", {}),
+                   ("/api/search/recommendations", {}),
+                   ("/api/taste", {"window": "all"}), ("/api/review", {}), ("/api/ads", {}),
                    ("/api/follow", {}))
 
 
 def _start_ledger_services(settings: PeachSettings, contract, services) -> bool:
     """只读核对当前账本后，恢复任务并启动依赖账本的后台服务。"""
+    try:
+        # 上次从备份恢复没走完：先把账本收拾到确定的状态，再判它能不能用（ADR-0138）。
+        ledger_backups.recover(settings.db_path)
+    except Exception:
+        LOGGER.exception('账本恢复标记未能处理')
     status = inspect_database(settings.db_path)
     repairs = getattr(contract, 'upgrade_repairs', None)
     if status['schema'] == 'pending' and repairs is not None and repairs.available:
@@ -342,6 +375,17 @@ class _LedgerActivation:
             await self.task
 
 
+def _configure_capacity_guard(settings, contract, services):
+    from .storage_budget import CapacityGuard
+    config = contract.upgrade_config
+    # 服务进程里这把闸门守的是播放、浏览与网络媒体缓存：总量超限只清理，不挡请求。
+    guard = (CapacityGuard(config, foreground=True)
+             if settings.transcode_root.parent.resolve() == config.directory('generated').resolve() else None)
+    contract.capacity_guard = guard
+    for service in services:
+        service.capacity_guard = guard
+
+
 def create_app(
     settings: PeachSettings | None = None,
     sync: LedgerSync | None = None,
@@ -377,10 +421,14 @@ def create_app(
     from .mount_reachability import source_roots
     mount_reachability = MountReachability(source_roots())
     from .network_reachability import NetworkReachability
-    network_reachability = NetworkReachability()
+    from .web_library_processing import retry_after_network_recovery
+    network_reachability = NetworkReachability(
+        on_recovered=lambda: retry_after_network_recovery(contract, sync))
+    # 处理任务在外部采集前按它判断网（`library_processing._network_gate`）。
+    contract.network_reachability = network_reachability
     resolver = FFmpegResolver(settings.ffmpeg_root)
     http_transport = HttpxTransport()
-    follow_media_resolver = FollowMediaResolver(http_transport).with_credential_loader(
+    follow_media_resolver = FollowMediaResolver(http_transport, state_root=settings.follow_state_root).with_credential_loader(
         lambda provider: web_follow._credential_store(contract).load(provider))
     # 检查更新、浏览与画面签名的取图共用这一份按站冷却：同一个站被限流，几处都得停。
     contract.follow_media_resolver = follow_media_resolver
@@ -407,9 +455,11 @@ def create_app(
                                                     edge=COVER_SMALL_THUMB_EDGE,
                                                     quality=COVER_SMALL_THUMB_QUALITY)
     transcode_service = TranscodeService(resolver, settings.transcode_root, state_root=settings.follow_state_root)
-    header_repairs = HeaderRepairStore(settings.transcode_root, resolver)
+    header_repairs = HeaderRepairStore(settings.transcode_root, resolver, runs=contract.task_runs)
+    # 分片计划按会话记住（`SessionPlans`），这里只跑没记过的那一次；一次可能要等 ffprobe，
+    # 两个线程时两部探不动的片子就让所有会话的分片排队。
     hls_plan_executor = ThreadPoolExecutor(
-        max_workers=2, thread_name_prefix="PeachHlsPlan",
+        max_workers=8, thread_name_prefix="PeachHlsPlan",
     )
     hls_service = HlsSegmentService(
         resolver, settings.stream_root, prefer_hardware=transcode_service.prefer_hardware,
@@ -454,11 +504,14 @@ def create_app(
     contract.downloads = downloads
     from .jav_browser import JavBrowser
     from .web_resource_search import q_resource_search
-    jav_browser = JavBrowser(contract, search=q_resource_search)
+    from .jav_editions import EditionProbe
+    jav_browser = JavBrowser(contract, search=q_resource_search,
+                             edition_probe=EditionProbe(contract.follow_secrets_root))
     contract.follow_scheduler = follow_scheduler
     # 订阅源拉取（ADR-0042）用同一个调度实现，只换 job id、状态文件与默认间隔。
     # 默认 6 小时：一位女优的 JavDB 演员页一天更新几条，比这更密只是把 JavDB 的配额
-    # 花在一张没变的页面上。
+    # 花在一张没变的页面上。6 小时是每个源的周期；调度每半小时看一次谁到期，各源按
+    # 自己的相位错开（ADR-0134）。
     feed_scheduler = FollowUpdateScheduler(
         settings.follow_state_root,
         lambda: web_feeds.w_feed_check(contract, {"automatic": True}),
@@ -467,6 +520,7 @@ def create_app(
         filename="feed-schedule.json",
         default=FollowScheduleConfig(enabled=True,
                                      interval_minutes=feeds.DEFAULT_INTERVAL_MINUTES),
+        tick_minutes=feeds.TICK_MINUTES,
         unavailable_message="订阅源拉取只在写入端可用",
     )
     contract.feed_scheduler = feed_scheduler
@@ -488,6 +542,8 @@ def create_app(
         available=managed_configuration() and bool(settings.configured),
     )
     upgrade_repairs = _configure_upgrade_repairs(settings, contract, sync)
+    _configure_capacity_guard(settings, contract,
+        (transcode_service, hls_service, entity_thumb_service, cover_thumb_service, cover_small_thumb_service))
 
     async def warm_startup_entries():
         """配置页首屏要的开机启动项状态，先在后台问一遍。
@@ -507,10 +563,8 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        from .error_reporting import asyncio_handler
-        loop = asyncio.get_running_loop()
-        previous_error_handler = loop.get_exception_handler()
-        loop.set_exception_handler(asyncio_handler)
+        # asyncio 异常处理器由 `cli._run_uvicorn` 装在 uvicorn 的事件循环上：它要拿着 uvicorn
+        # 的 Server，才能在监听被标准库关掉后重新监听。
         # 握手要等 cloudflared 连上边缘，断网时会等满 `wait_timeout`；放在后台，本机访问
         # 不等公网入口。连接进度由 `tunnel_manager.snapshot()` 报告。
         tunnel_startup = asyncio.create_task(asyncio.to_thread(_start_tunnel, settings, tunnel_manager))
@@ -532,10 +586,11 @@ def create_app(
         try:
             yield
         finally:
+            # 外部播放器的最后一段观看要赶在账本收尾前落下。
+            await asyncio.to_thread(_app.state.playback_trackers.stop)
             await activation.stop()
             _app.state.ledger_background_ready = False
             aggregate_stop.set()
-            loop.set_exception_handler(previous_error_handler)
             warmup.cancel()
             recovery_service.stop()
             follow_scheduler.stop()
@@ -553,6 +608,7 @@ def create_app(
             # 死链检查和资源对账的后台线程是 daemon，本来挡不住进程退出；这里显式收
             # 一下，免得在途的那一轮在解释器拆卸期间还继续查库、往没人读的状态里写。
             contract.stop_background_jobs()
+            header_repairs.stop()
             from . import face_models
             face_models.detach(contract.task_runs)
             if mdns is not None:
@@ -582,6 +638,8 @@ def create_app(
     app.state.media_engine = media_engine
     app.state.preview_service = preview_service
     app.state.photo_service = photo_service
+    from .subtitles import SidecarListings
+    app.state.sidecar_listings = SidecarListings()
     app.state.sample_cache = sample_cache
     app.state.entity_thumb_service = entity_thumb_service
     app.state.cover_thumb_service = cover_thumb_service
@@ -589,6 +647,8 @@ def create_app(
     app.state.transcode_service = transcode_service
     app.state.header_repairs = header_repairs
     app.state.hls_plan_executor = hls_plan_executor
+    from .segments import SessionPlans
+    app.state.hls_session_plans = SessionPlans()
     app.state.hls_service = hls_service
     app.state.mdns = mdns
     app.state.providers = providers
@@ -600,6 +660,10 @@ def create_app(
     app.state.follow_scheduler = follow_scheduler
     app.state.automatic_updates = automatic_updates
     app.state.upgrade_repairs = upgrade_repairs
+    from pathlib import Path
+    from .follow_evidence import Reclaim
+    app.state.follow_evidence = Reclaim(Path(contract.follow_sources_root) / "follow", contract,
+                                        runs=contract.task_runs)
     app.state.push_discovery = push_discovery
     app.state.downloads = downloads
     app.state.jav_browser = jav_browser
@@ -612,6 +676,8 @@ def create_app(
     app.state.strm_resources = StrmResources()
     import secrets
     app.state.external_playback_key = secrets.token_bytes(32)
+    from .playback_tracking import PlaybackTrackers
+    app.state.playback_trackers = PlaybackTrackers()
     app.state.sync = sync
     app.state.tunnel = tunnel_manager
 
@@ -674,6 +740,7 @@ def create_app(
         name="vendor",
     )
 
+    app.add_middleware(FirstSetupSourceMiddleware)
     app.add_middleware(ResponseHeadersMiddleware)
 
     # JSON 契约、页面脚本与样式是仅有的几类大文本响应，压下去省的字节最多：

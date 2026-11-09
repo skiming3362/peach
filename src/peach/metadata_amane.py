@@ -36,6 +36,7 @@ from .sources.base import (COOLDOWN_ACTIONS, REASON_KINDS, FailureReason, SiteCo
                            SourceFailure)
 from .user_agent import USER_AGENT
 from .settings_file import PROJECT_ROOT
+from .task_control import run as run_task_process
 
 AMANE_REPOSITORY = "https://github.com/sqzw-x/amane"
 AMANE_LICENSE = "GPL-3.0"
@@ -270,10 +271,12 @@ def bundle_problem(root: Path = BRIDGE_ROOT) -> str:
     return ""
 
 
-def rebuild(tools_root: Path, *, runner: Runner = subprocess.run, timeout: int = 900,
+def rebuild(tools_root: Path, *, runner: Runner = run_task_process, timeout: int = 900,
             root: Path = BRIDGE_ROOT, proxy_options: Mapping[str, object] | None = None,
             force: bool = True) -> dict:
     """重建桥 venv，返回给设置页的回执。首次要下载约 98 MB，之后只校验。"""
+    from .task_resources import unobserved_network
+    unobserved_network('独立采集工具的网络传输未提供逐任务计量')
     if packaged_runtime(root=root):
         return {"ok": True, "result": "采集工具已随 Peach 安装，无需另行准备",
                 **describe(tools_root, root=root)}
@@ -290,6 +293,21 @@ def rebuild(tools_root: Path, *, runner: Runner = subprocess.run, timeout: int =
     except OSError as error:
         from .error_reporting import redact
         return {"ok": False, "error": f"amane 安装目录无法读写：{redact(str(error))}"}
+
+
+def _uv_failure(output: str, limit: int = 800) -> str:
+    """uv 报错的首行说哪一步失败，末尾是 git 或构建的原始输出。太长时保留首行和末尾若干整行：
+    任务卡用首行当摘要，按字符截会让它从半个词读起。"""
+    lines = output.strip().splitlines()
+    if len(output.strip()) <= limit or len(lines) < 2:
+        return output.strip()[-limit:]
+    tail, size = [], 0
+    for line in reversed(lines[1:]):
+        size += len(line) + 1
+        if size > limit:
+            break
+        tail.append(line)
+    return "\n".join([lines[0], "…", *reversed(tail)])
 
 
 def _rebuild(tools_root, *, runner, timeout, root, proxy_options):
@@ -314,7 +332,7 @@ def _rebuild(tools_root, *, runner, timeout, root, proxy_options):
     except OSError as exc:
         return {"ok": False, "error": f"无法启动 uv：{redact(str(exc))}"}
     if completed.returncode:
-        detail = (completed.stderr or completed.stdout or "").strip()[-800:]
+        detail = _uv_failure(completed.stderr or completed.stdout or "")
         return {"ok": False, "error": f"uv sync 失败（exit {completed.returncode}）：{redact(detail)}"}
     if not bridge_python(tools_root).is_file() or installed_version(tools_root) != locked_version(root):
         return {"ok": False, "error": "amane 安装未完成：运行环境中没有可用的包元数据"}
@@ -338,7 +356,7 @@ def _rebuild(tools_root, *, runner, timeout, root, proxy_options):
             **describe(tools_root, root=root)}
 
 
-def ensure(tools_root: Path, *, runner: Runner = subprocess.run,
+def ensure(tools_root: Path, *, runner: Runner = run_task_process,
            proxy_options: Mapping[str, object] | None = None, secrets_root: Path | None = None,
            progress=lambda: None) -> None:
     """按锁准备一次独立运行环境；安装失败由调用方保留尚未处理的范围。"""
@@ -446,11 +464,11 @@ class AmaneBridge:
     python: Path
     script: Path | None = BRIDGE_SCRIPT
     timeout: int = DEFAULT_TIMEOUT
-    runner: Runner = subprocess.run
+    runner: Runner = run_task_process
 
     @classmethod
     def create(cls, tools_root: Path, *, timeout: int = DEFAULT_TIMEOUT,
-               runner: Runner = subprocess.run) -> "AmaneBridge":
+               runner: Runner = run_task_process) -> "AmaneBridge":
         packaged = packaged_runtime()
         if packaged:
             return cls(packaged[0], script=None if packaged[1] == "executable" else BRIDGE_SCRIPT,

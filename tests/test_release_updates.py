@@ -1,11 +1,14 @@
 """发行通道、故障状态和独立托盘检查的隔离回归。"""
 import json
+from pathlib import Path
+import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
 import httpx
 
-from peach import release_updates
+from peach import distribution, docker_update, release_updates
 from peach.http import HttpResponse
 from peach.versioning import VersionManager
 
@@ -16,35 +19,66 @@ def release(version, **extra):
 
 
 class ReleaseUpdateTests(unittest.TestCase):
-    def check(self, rows, status=200, version="0.9.0", headers=None):
-        transport = Mock(return_value=HttpResponse(status, headers or {}, json.dumps(rows).encode()))
-        with patch.object(release_updates, "__version__", version):
-            return release_updates.check(transport=transport)
+    def setUp(self):
+        # 选包跟着本机系统走；这一组用例按 Windows 包写，在 macOS runner 上同样要选 Windows 包。
+        windows = patch.object(release_updates, "sys", SimpleNamespace(platform="win32"))
+        windows.start()
+        self.addCleanup(windows.stop)
 
-    def test_the_channel_is_a_single_repository_without_a_mirror(self):
-        """发布通道只有一处：多一个镜像源等于多一条要跟着改的地址。"""
-        self.assertTrue(release_updates.API_URL.startswith("https://api.github.com/repos/"))
-        self.assertIn(release_updates.REPOSITORY, release_updates.API_URL)
-        self.assertEqual(release_updates.RELEASES_URL,
-                         f"https://github.com/{release_updates.REPOSITORY}/releases")
-        calls = []
-        transport = Mock(side_effect=lambda request, *_: calls.append(request.url) or
-                         HttpResponse(200, {}, json.dumps([release("1.0.0")]).encode()))
-        with patch.object(release_updates, "__version__", "0.9.0"):
-            release_updates.check(transport=transport)
-        self.assertEqual(calls, [release_updates.API_URL])
-
-    def test_a_download_url_is_built_from_the_tag_not_taken_from_the_row(self):
-        """发行条目里的下载地址是发布者可改的字段，只认 tag 与摘要。"""
+    def test_a_failed_github_listing_is_an_error_and_the_mirror_cannot_stand_in(self):
         row = release("1.0.0")
         row["assets"][0].update(size=123, digest="sha256:" + "a" * 64,
                                 browser_download_url="https://untrusted.invalid/package.zip")
-        result = self.check([row])
-        self.assertEqual(result["state"], "available")
-        self.assertEqual(result["asset_url"], release_updates.RELEASES_URL + "/download/v1.0.0/Peach-1.0.0-windows-x64.zip")
-        self.assertEqual(result["asset_digest"], "sha256:" + "a" * 64)
-        self.assertEqual(result["release_url"], release_updates.RELEASES_URL + "/tag/v1.0.0")
-        self.assertEqual(release_updates.download_sources(result["asset_url"]), (result["asset_url"],))
+
+        def transport(request, *_args):
+            if request.url == release_updates.API_URL:
+                raise httpx.ConnectError("GitHub unavailable")
+            return HttpResponse(200, {}, json.dumps([row]).encode())
+
+        with patch.object(release_updates, "__version__", "0.9.0"):
+            result = release_updates.check(transport=transport)
+        self.assertEqual(result["state"], "error", "镜像挂的是上游的包，不能让本机升到上游版本")
+        self.assertIsNone(result["latest_version"])
+        self.assertNotIn("asset_url", result)
+
+    def test_the_mirror_never_contributes_a_version(self):
+        mirror = release("3.0.0")
+        mirror["assets"][0].update(size=123, digest="sha256:" + "a" * 64)
+
+        def transport(request, *_args):
+            rows = [release("1.0.0")] if request.url == release_updates.API_URL else [mirror]
+            return HttpResponse(200, {}, json.dumps(rows).encode())
+
+        with patch.object(release_updates, "__version__", "0.9.0"):
+            result = release_updates.check(transport=transport)
+        self.assertEqual(result["latest_version"], "1.0.0", "最新版只看 fork 的发布列表")
+        self.assertEqual(result["asset_url"],
+                         release_updates.RELEASES_URL + "/download/v1.0.0/Peach-1.0.0-windows-x64.zip")
+
+    def test_a_missing_or_broken_listing_cannot_confirm_current_or_ahead(self):
+        for status, body in ((403, []), (200, {}), (200, []), (200, [dict(release("0.56.0"), assets=[])])):
+            with self.subTest(status=status, body=body):
+                transport = Mock(return_value=HttpResponse(status, {}, json.dumps(body).encode()))
+                with patch.object(release_updates, "__version__", "0.54.0"):
+                    result = release_updates.check(transport=transport)
+                self.assertEqual(result["state"], "error" if status != 200 or body == {} else "empty")
+                self.assertIsNone(result["latest_version"])
+                self.assertNotIn("asset_url", result)
+
+    def test_macos_cannot_confirm_no_update_when_the_listing_is_unavailable(self):
+        row = release("0.54.0")
+        row["assets"].append({"name": "Peach-0.54.0-macos-arm64.dmg", "state": "uploaded",
+                              "digest": "sha256:" + "a" * 64})
+        transport = Mock(return_value=HttpResponse(403, {}, json.dumps([row]).encode()))
+        with patch.object(release_updates, "__version__", "0.54.0"):
+            result = release_updates.check(transport=transport, system="darwin", machine="arm64")
+        self.assertEqual(result["state"], "error")
+        self.assertIsNone(result["latest_version"])
+
+    def check(self, rows, status=200):
+        transport = Mock(return_value=HttpResponse(status, {}, json.dumps(rows).encode()))
+        with patch.object(release_updates, "__version__", "0.9.0"):
+            return release_updates.check(transport=transport)
 
     def test_channel_includes_prereleases_and_orders_versions_numerically(self):
         result = self.check([release("0.9.0"), release("0.10.0")])
@@ -84,28 +118,52 @@ class ReleaseUpdateTests(unittest.TestCase):
     def test_failures_do_not_claim_current_or_keep_a_latest_version(self):
         self.assertEqual(self.check({}, status=429)["state"], "error")
         self.assertEqual(self.check({})["state"], "error")
-        self.assertEqual(self.check([])["state"], "empty")
         for cause in (httpx.ConnectError("offline"), httpx.ReadTimeout("timeout")):
             result = release_updates.check(transport=Mock(side_effect=cause))
             self.assertEqual(result["state"], "error")
             self.assertIsNone(result["latest_version"])
 
-    def test_a_refusal_says_what_went_wrong_instead_of_just_please_retry(self):
-        """配额用尽和网络故障都要落到同一句「请重试」时，人看不出该等还是该改代理。"""
-        exhausted = self.check({}, status=403, headers={"x-ratelimit-remaining": "0"})
-        self.assertEqual(exhausted["state"], "error")
-        self.assertIn("配额", exhausted["message"])
-        missing = self.check({}, status=404)
-        self.assertIn(release_updates.REPOSITORY, missing["message"])
-        other = self.check({}, status=502)
-        self.assertIn("502", other["message"])
+    def test_a_listing_that_answers_can_report_current_and_ahead(self):
+        def transport(github_version):
+            return Mock(return_value=HttpResponse(200, {}, json.dumps([release(github_version)]).encode()))
 
-    def test_the_only_source_reports_current_and_ahead(self):
-        for version, state in (("0.46.1", "ahead"), ("0.48.2", "current")):
-            with self.subTest(published=version):
-                self.assertEqual(self.check([release(version)], version="0.48.2")["state"], state)
-        self.assertEqual(self.check([release("0.49.0")], version="0.48.2")["state"], "available",
-                         "源上真有更新的版本时照样可以升")
+        with patch.object(release_updates, "__version__", "0.48.2"):
+            for version, state in (("0.46.1", "ahead"), ("0.48.2", "current")):
+                with self.subTest(github=version):
+                    result = release_updates.check(transport=transport(version))
+                    self.assertEqual(result["state"], state)
+            self.assertEqual(release_updates.check(transport=transport("0.49.0"))["state"], "available",
+                             "发布列表上真有更新的版本时照样可以升")
+
+    def test_the_release_listing_is_the_only_feed(self):
+        row = release("1.0.0")
+        row["assets"][0].update(size=123, digest="sha256:" + "a" * 64)
+        calls = []
+
+        def transport(request, *_args):
+            calls.append(request.url)
+            return HttpResponse(200, {}, json.dumps([row]).encode())
+
+        result = release_updates.check(transport=transport)
+        self.assertEqual(calls, [release_updates.API_URL], "镜像不参与发行列表")
+        self.assertEqual(result["asset_url"], release_updates.RELEASES_URL + "/download/v1.0.0/Peach-1.0.0-windows-x64.zip")
+
+    def test_tool_package_is_the_newest_release_carrying_that_tool_with_a_digest(self):
+        def tools(version, digest=True):
+            row = release(version)
+            row["assets"].append({"name": f"Peach-{version}-windows-x64-tools-ffmpeg.zip", "state": "uploaded",
+                                  "size": 42, **({"digest": "sha256:" + "b" * 64} if digest else {})})
+            return row
+
+        github = [tools("2.0.0", digest=False), tools("1.5.0"), release("3.0.0")]
+
+        transport = Mock(return_value=HttpResponse(200, {}, json.dumps(github).encode()))
+
+        self.assertEqual(release_updates.tool_package("ffmpeg", transport=transport), {
+            "url": release_updates.RELEASES_URL + "/download/v1.5.0/Peach-1.5.0-windows-x64-tools-ffmpeg.zip",
+            "size": 42, "digest": "sha256:" + "b" * 64, "version": "1.5.0"})
+        with self.assertRaisesRegex(ValueError, "工具包"):
+            release_updates.tool_package("untrunc", transport=transport)
 
     def test_standalone_tray_checks_releases_without_git(self):
         execute = Mock(side_effect=AssertionError("Git must not run"))
@@ -117,6 +175,258 @@ class ReleaseUpdateTests(unittest.TestCase):
         self.assertIn("1.0.0", result.message)
         execute.assert_not_called()
 
+    def test_macos_offers_the_dmg_for_its_own_architecture_without_in_app_install(self):
+        row = release("1.0.0")
+        row["assets"] += [
+            {"name": "Peach-1.0.0-macos-arm64.dmg", "state": "uploaded", "size": 456, "digest": "sha256:" + "b" * 64},
+            {"name": "Peach-1.0.0-macos-x86_64.dmg", "state": "uploaded", "size": 789},
+        ]
+        transport = Mock(return_value=HttpResponse(200, {}, json.dumps([row]).encode()))
+        with patch.object(release_updates, "__version__", "0.9.0"):
+            result = release_updates.check(transport=transport, system="darwin", machine="arm64")
+            intel = release_updates.check(transport=transport, system="darwin", machine="x86_64")
+        self.assertEqual(result["state"], "available")
+        self.assertEqual(result["package_kind"], "installer")
+        self.assertEqual(result["asset_url"], release_updates.RELEASES_URL + "/download/v1.0.0/Peach-1.0.0-macos-arm64.dmg")
+        self.assertEqual(result["asset_size"], 456)
+        self.assertTrue(intel["asset_url"].endswith("Peach-1.0.0-macos-x86_64.dmg"))
+        with patch("peach.distribution.standalone", return_value=True):
+            with patch.object(distribution, "sys", SimpleNamespace(platform="darwin")):
+                self.assertFalse(release_updates.snapshot()["in_app_update"], "macOS 独立包没有应用内安装")
+            with patch.object(distribution, "sys", SimpleNamespace(platform="win32")):
+                self.assertTrue(release_updates.snapshot()["in_app_update"])
 
-if __name__ == "__main__":
-    unittest.main()
+    def docker_check(self, digests, *, auth_status=200):
+        """Release 列表给 1.0.0；镜像仓库按 `digests` 回各标签的摘要，缺的标签回 404。"""
+        calls = []
+
+        def transport(request, *_args):
+            calls.append(request)
+            if request.url.startswith(docker_update.REGISTRY_AUTH):
+                return HttpResponse(auth_status, {}, json.dumps({"token": "anonymous"}).encode())
+            if request.url.startswith(docker_update.REGISTRY):
+                digest = digests.get(request.url.rsplit("/", 1)[1])
+                return HttpResponse(200 if digest else 404, {"Docker-Content-Digest": digest} if digest else {}, b"")
+            return HttpResponse(200, {}, json.dumps([release("1.0.0")]).encode())
+
+        with patch.dict("os.environ", {"PEACH_DISTRIBUTION": "docker"}), \
+                patch.object(release_updates, "__version__", "0.9.0"), \
+                patch.object(docker_update, "status", return_value={"available": True, "reason": ""}):
+            return release_updates.check(transport=transport, system="linux", machine="x86_64"), calls
+
+    def test_docker_image_reports_itself_and_gives_host_steps_instead_of_a_package(self):
+        same = "sha256:" + "a" * 64
+        with patch.dict("os.environ", {"PEACH_DISTRIBUTION": "docker"}):
+            snapshot = release_updates.snapshot()
+        result, calls = self.docker_check({"1.0.0": same, "edge": same})
+        self.assertEqual(snapshot["installation"], "Docker 镜像", "此前显示成「源码运行」")
+        self.assertEqual([step["command"] for step in snapshot["steps"]],
+                         ["docker compose pull", "docker compose up -d"])
+        self.assertEqual((result["state"], result["latest_version"]), ("available", "1.0.0"))
+        self.assertEqual(result["release_url"], release_updates.RELEASES_URL + "/tag/v1.0.0")
+        self.assertNotIn("package_kind", result, "容器不下载 Windows 发行包")
+        self.assertNotIn("asset_url", result)
+        self.assertEqual(result["one_click"], {"available": True, "reason": ""})
+        manifests = [request for request in calls if "/manifests/" in request.url]
+        self.assertEqual({request.method for request in manifests}, {"HEAD"}, "只读摘要，不下载 manifest 正文与镜像层")
+        self.assertTrue(all(request.headers["Authorization"] == "Bearer anonymous" for request in manifests))
+        self.assertFalse(any("Authorization" in request.headers for request in calls if request not in manifests),
+                         "匿名令牌只发给镜像仓库")
+        with patch.dict("os.environ", {"PEACH_DISTRIBUTION": ""}):
+            self.assertEqual(release_updates.snapshot()["steps"], [])
+
+    def test_docker_release_waits_until_edge_points_at_the_pushed_version(self):
+        old, new = "sha256:" + "a" * 64, "sha256:" + "b" * 64
+        for digests in ({}, {"edge": old}, {"1.0.0": new, "edge": old}):
+            with self.subTest(digests=digests):
+                result, _ = self.docker_check(digests)
+                self.assertEqual(result["state"], "pending", "Release 已建、镜像还没推送时不能提示拉取")
+                self.assertEqual(result["latest_version"], "1.0.0")
+                self.assertIn("镜像尚未发布", result["message"])
+                self.assertNotIn("one_click", result, "镜像没推送时不给一键更新")
+        result, _ = self.docker_check({"1.0.0": new, "edge": new}, auth_status=503)
+        self.assertEqual(result["state"], "error", "读不到镜像仓库就是没查成，不当成有新版")
+
+    def test_macos_skips_releases_without_its_dmg(self):
+        transport = Mock(return_value=HttpResponse(200, {}, json.dumps([release("1.0.0")]).encode()))
+        with patch.object(release_updates, "__version__", "0.9.0"):
+            result = release_updates.check(transport=transport, system="darwin", machine="arm64")
+        self.assertEqual(result["state"], "empty", "只有 Windows 包的版本不能提示 macOS 更新")
+
+
+class DockerUpdateTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.dict("os.environ", {docker_update.IMAGE_TAG_ENV: "edge",
+                                                    docker_update.UPDATE_DIR_ENV: str(self.root)}))
+
+    def watchtower(self, post_status, *, reachable=True):
+        """假 Watchtower：探测（GET）回 401 表示在线，更新请求（POST）回 `post_status`。"""
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            if not reachable:
+                raise httpx.ConnectError("Name or service not known", request=request)
+            return httpx.Response(401 if request.method == "GET" else post_status)
+        return httpx.MockTransport(handler), requests
+
+    def test_token_is_generated_once_and_kept(self):
+        docker_update.ensure_token()
+        path = self.root / docker_update.TOKEN_NAME
+        first = path.read_text(encoding="utf-8")
+        self.assertGreaterEqual(len(first), 40)
+        docker_update.ensure_token()
+        self.assertEqual(path.read_text(encoding="utf-8"), first, "Watchtower 只在启动时读一次，换了就对不上")
+        with patch.dict("os.environ", {docker_update.UPDATE_DIR_ENV: ""}):
+            docker_update.ensure_token()  # 不在官方镜像里：没有令牌目录，什么也不做
+
+    def test_one_click_needs_a_rolling_tag_a_token_and_a_reachable_watchtower(self):
+        transport, _ = self.watchtower(202)
+        self.assertIn("令牌", docker_update.status(transport=transport)["reason"])
+        docker_update.ensure_token()
+        self.assertEqual(docker_update.status(transport=transport), {"available": True, "reason": ""})
+        self.assertEqual(docker_update.status(transport=self.watchtower(202, reachable=False)[0]),
+                         {"available": False, "reason": ""}, "没启用 watchtower profile 时照常给两步命令，不报错")
+        for tag, message in (("0.53.0", ".env"), ("", "compose.yaml")):
+            with self.subTest(tag=tag), patch.dict("os.environ", {docker_update.IMAGE_TAG_ENV: tag}):
+                state = docker_update.status(transport=transport)
+                self.assertFalse(state["available"])
+                self.assertIn(message, state["reason"], "旧 compose 没传标签时要指向 compose 文件，不是 .env")
+
+    def test_trigger_posts_an_async_update_with_the_generated_token(self):
+        docker_update.ensure_token()
+        token = (self.root / docker_update.TOKEN_NAME).read_text(encoding="utf-8")
+        transport, requests = self.watchtower(202)
+        self.assertEqual(docker_update.trigger(transport=transport)["state"], "updating")
+        posted = [request for request in requests if request.method == "POST"]
+        self.assertEqual([str(request.url) for request in posted], [docker_update.WATCHTOWER_URL + "/v1/update?async=true"],
+                         "同步请求的响应会被 Watchtower 停容器打断")
+        self.assertEqual(posted[0].headers["Authorization"], f"Bearer {token}")
+        self.assertFalse(any("Authorization" in request.headers for request in requests if request.method == "GET"),
+                         "探测不带令牌")
+        for status, message in ((401, "docker compose restart watchtower"), (429, "另一次更新"), (500, "HTTP 500")):
+            with self.subTest(status=status), self.assertRaisesRegex((ValueError, OSError), message):
+                docker_update.trigger(transport=self.watchtower(status)[0])
+
+    def test_trigger_refuses_before_contacting_watchtower_when_it_cannot_update(self):
+        transport, requests = self.watchtower(202)
+        docker_update.ensure_token()
+        with patch.dict("os.environ", {docker_update.IMAGE_TAG_ENV: "0.53.0"}), self.assertRaisesRegex(ValueError, "edge"):
+            docker_update.trigger(transport=transport)
+        self.assertEqual(requests, [], "换不到新版本时不打扰 Watchtower")
+        with self.assertRaisesRegex(ValueError, "watchtower profile"):
+            docker_update.trigger(transport=self.watchtower(202, reachable=False)[0])
+
+
+class ReleaseNoticeTests(unittest.TestCase):
+    """更新公告：新安装不弹，上一版升级弹当前版，跳版补列错过的要点，按平台与本机数据挑条目。"""
+
+    def setUp(self):
+        import sqlite3
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.connection = sqlite3.connect(Path(temporary.name) / 'ledger.db')
+        self.addCleanup(self.connection.close)
+        self.connection.executescript("""
+            CREATE TABLE profile(id TEXT PRIMARY KEY,settings_json TEXT,updated_at TEXT);
+            INSERT INTO profile VALUES('local-default','{"sidebarOrder":["tags"]}','');
+            CREATE TABLE schema_migration(version TEXT PRIMARY KEY,name TEXT,checksum TEXT,applied_at TEXT);
+        """)
+
+    def migrations(self, *rows):
+        self.connection.executemany("INSERT INTO schema_migration VALUES(?,?,?,?)",
+                                    [(version, 'm', 'c', stamp) for version, stamp in rows])
+
+    def snapshot(self, **options):
+        from peach import release_notice
+        options.setdefault('tokens', {'windows', 'standalone'})
+        options.setdefault('current', '0.57.0')
+        return release_notice.snapshot(self.connection, **options)
+
+    def seen(self, version):
+        self.connection.execute("UPDATE profile SET settings_json=?",
+                                (json.dumps({'sidebarOrder': ['tags'], 'release_notice': {'seen': version}}),))
+
+    def test_a_fresh_install_is_not_shown_an_update_notice(self):
+        self.migrations(('0001', '2026-11-07T01:00:00+00:00'), ('0052', '2026-11-07T01:00:05+00:00'))
+        result = self.snapshot()
+        self.assertEqual(result['kind'], 'new-install')
+        self.assertFalse(result['show'])
+
+    def test_an_upgrade_from_the_previous_release_shows_the_current_notice_only(self):
+        self.seen('0.56.0')
+        result = self.snapshot()
+        self.assertEqual((result['kind'], result['show'], result['missed']), ('upgrade', True, []))
+        self.assertIn('容量保护', [item['title'] for item in result['notice']['features']])
+
+    def test_skipping_releases_lists_what_was_missed_newest_first_and_skips_quiet_ones(self):
+        self.seen('0.53.0')
+        result = self.snapshot()
+        self.assertEqual(result['kind'], 'skipped')
+        self.assertEqual([row['version'] for row in result['missed']], ['0.56.0', '0.55.0', '0.54.0'])
+
+    def test_a_ledger_without_a_record_estimates_the_previous_release_from_its_migrations(self):
+        self.migrations(('0001', '2026-08-01T00:00:00+00:00'), ('0050', '2026-10-27T00:00:00+00:00'),
+                        ('0052', '2026-11-08T00:00:00+00:00'))
+        result = self.snapshot()
+        self.assertEqual((result['kind'], result['previous'], result['estimated']), ('upgrade', '0.51.0', True))
+        self.assertTrue(result['show'])
+        self.assertEqual(result['missed'][0]['version'], '0.56.0')
+
+    def test_items_follow_the_platform_and_the_data_on_this_machine(self):
+        self.seen('0.53.0')
+        windows = self.snapshot()
+        docker = self.snapshot(tokens={'linux', 'docker'}, facts={'system_files': {'count': 12}})
+        titles = lambda result, version: [row['title'] for row in result['missed']
+                                          if row['version'] == version for row in row['features']]
+        self.assertNotIn('Docker 首次设置', titles(windows, '0.56.0'))
+        self.assertIn('Docker 首次设置', titles(docker, '0.56.0'))
+        self.assertNotIn('macOS 应用内更新', titles(windows, '0.54.0'))
+        self.assertEqual(windows['notice']['automatic'], [])
+        self.assertEqual(docker['notice']['automatic'],
+                         [{'id': 'system-files', 'icon': 'server', 'title': '移出系统附属文件',
+                           'progress': {'count': 12}, 'body': docker['notice']['automatic'][0]['body']}])
+
+    def test_acknowledging_only_moves_forward_and_hides_the_notice(self):
+        from peach import release_notice
+        self.seen('0.56.0')
+        release_notice.acknowledge(self.connection, '0.57.0')
+        release_notice.acknowledge(self.connection, '0.56.0')
+        stored = json.loads(self.connection.execute('SELECT settings_json FROM profile').fetchone()[0])
+        self.assertEqual(stored['release_notice']['seen'], '0.57.0')
+        self.assertEqual(stored['sidebarOrder'], ['tags'])
+        self.assertEqual((self.snapshot()['kind'], self.snapshot()['show']), ('seen', False))
+
+    def test_every_notice_uses_known_platforms_conditions_and_levels(self):
+        from peach import release_notice
+        from peach.release_notices import NOTICES
+        for version, notice in NOTICES.items():
+            self.assertIn(notice['level'], {'notice', 'quiet'}, version)
+            for section in ('features', 'automatic', 'attention'):
+                for item in notice.get(section, []):
+                    tokens = {part for token in item.get('platforms', []) for part in token.split('+')}
+                    self.assertLessEqual(tokens, release_notice.PLATFORM_TOKENS, (version, item['title']))
+                    self.assertIn(item.get('when', 'display_reprobe'), release_notice.FACTS, (version, item['title']))
+
+
+class ReleaseNoticeFactsTests(unittest.TestCase):
+    """公告条目的显示条件只读本机回执：移出过系统文件、解除过乱码人物关联才显示对应条目。"""
+
+    def test_counts_come_from_the_latest_upgrade_receipts(self):
+        import sqlite3
+        from peach import routes_configuration
+        connection = sqlite3.connect(':memory:')
+        self.addCleanup(connection.close)
+        connection.execute('CREATE TABLE ledger_upgrade_repair(id TEXT, result_json TEXT, applied_at TEXT)')
+        connection.executemany('INSERT INTO ledger_upgrade_repair VALUES(?,?,?)', [
+            ('a', json.dumps({'discovery-system-files-3': {'isolated': [{'id': 1}, {'id': 2}]}}), '1'),
+            ('b', json.dumps({'garbled_people': {'links': [{'asset_id': 7}], 'tags': [], 'entities': []}}), '2'),
+            ('javdb-actor-records-1', json.dumps({'rule': 1, 'recorded': [{}, {}, {}],
+                                                  'hidden': [{}, {}], 'disabled_feeds': [{}]}), '3'),
+        ])
+        request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
+            upgrade_repairs=SimpleNamespace(available=False))))
+        facts = routes_configuration._release_notice_facts(request, connection)
+        self.assertEqual(facts, {'system_files': {'count': 2}, 'garbled_performers': {'count': 1},
+                                 'javdb_entries': {'count': 3}})

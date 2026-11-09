@@ -25,6 +25,7 @@ import { CollectionSummary } from '../components/collection-summary';
 import { useOverlayScrollbar } from '../components/overlay-scrollbar';
 import { useViewGlide } from '../components/use-view-glide';
 import { junkCount, type JunkPage, type JunkRoute } from './junk-queue';
+import { t } from '../../i18n';
 
 function Icon({ name }: { name: string }) {
   return <svg viewBox="0 0 24 24" aria-hidden="true"><use href={`#i-${name}`} /></svg>;
@@ -42,15 +43,17 @@ function BatchKeys({ selectMode, ids, selected, onSelectMode, onSelectAll }: {
 }) {
   const all = ids.length > 0 && ids.every((id) => selected.has(id));
   return (
-    <div data-junk-batch="" role="group" aria-label="批量选择">
+    <div data-junk-batch="" role="group" aria-label={t('cleanup:junk.batchGroup')}>
       <button type="button" data-junk-select-mode="" aria-pressed={selectMode}
-        title={selectMode ? '退出多选并清空已选' : '进入多选，点卡片挑选要处置的文件'}
+        title={selectMode ? t('cleanup:junk.cancelSelectionTitle') : t('cleanup:junk.selectModeTitle')}
         onClick={() => onSelectMode(!selectMode)}>
-        <Icon name={selectMode ? 'x' : 'square-check-big'} /><span>{selectMode ? '取消选择' : '选择文件'}</span>
+        <Icon name={selectMode ? 'x' : 'square-check-big'} />
+        <span>{selectMode ? t('cleanup:junk.cancelSelection') : t('cleanup:junk.selectFiles')}</span>
       </button>
       {selectMode && ids.length > 0 ? (
         <button type="button" data-junk-select-all="" onClick={() => onSelectAll(ids, !all)}>
-          <Icon name={all ? 'rotate-ccw' : 'check-check'} /><span>{all ? '清空选择' : `全选 ${ids.length} 项`}</span>
+          <Icon name={all ? 'rotate-ccw' : 'check-check'} />
+          <span>{all ? t('cleanup:junk.clearSelection') : t('cleanup:junk.selectAll', { count: ids.length })}</span>
         </button>
       ) : null}
     </div>
@@ -78,7 +81,7 @@ export function JunkCount({ route, page, failed, selectMode, selected, onNavigat
     onNavigate(link.getAttribute('href') || junkPath());
   };
   /* 读不到就不再转圈：失败的原因写在网格那一格里，这里只说「没有数」。 */
-  const figure = page ? `${Number(page.total || 0).toLocaleString()} 个` : failed ? '—' : '';
+  const figure = page ? t('cleanup:junk.countFigure', { count: Number(page.total || 0) }) : failed ? '—' : '';
   return (
     <div data-junk-count="">
       <div data-junk-summary="" aria-live="polite">
@@ -88,7 +91,7 @@ export function JunkCount({ route, page, failed, selectMode, selected, onNavigat
       </div>
       <div data-junk-filters-frame="" data-filter-glass="" data-glass-pane="">
         <span ref={pane} data-view-glide="" aria-hidden="true" />
-        <nav ref={nav} data-junk-filters="" aria-label="垃圾文件分类" onClick={click} onPointerLeave={glide.leave}>
+        <nav ref={nav} data-junk-filters="" aria-label={t('cleanup:junk.categories')} onClick={click} onPointerLeave={glide.leave}>
           {JUNK_KIND_OPTIONS.map(([key, label, glyph]) => (
             <a key={key || 'all'} href={junkPath(key, view)} data-junk-kind-link={key}
               aria-current={key === kind ? 'page' : undefined} onPointerEnter={glide.hover}>

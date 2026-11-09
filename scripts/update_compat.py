@@ -30,10 +30,8 @@ from peach.update_packages import MANIFEST, SELF_PROVISIONED  # noqa: E402
 OLDEST_CLIENT = "0.48.0"
 
 #: 在旧版本的源码树里执行：只走它自己的检查与清单读取，网络换成本次的发布条目。
-#: 每个请求都回答同一份条目——旧版本的检查可能打它自己的 GitHub 端点，也可能打已经不
-#: 存在了的镜像端点，本文件不该替它挑，反正两处拿到的是同一版发布。
 PROBE = r"""
-import json, sys, tempfile
+import inspect, json, sys, tempfile
 from pathlib import Path
 from types import SimpleNamespace
 sys.path[:0] = [sys.argv[1]]
@@ -42,9 +40,17 @@ if not Path(peach.__file__).resolve().is_relative_to(Path(sys.argv[1]).resolve()
     raise SystemExit(f"导入的不是旧版本源码：{peach.__file__}")
 from peach import release_updates, update_packages
 payload = json.load(sys.stdin)
+#: 旧版本可能只查 GitHub，也可能另有镜像源；它自己的检查打哪个端点就回哪个，两处给同一份条目。
+endpoints = {getattr(release_updates, name, None) for name in ("API_URL", "DOWNLOADS_API")}
 def transport(request, *_):
-    return SimpleNamespace(status=200, headers={}, body=json.dumps(payload["rows"]).encode(), url=request.url)
-release = release_updates.check(transport=transport)
+    if request.url in endpoints:
+        return SimpleNamespace(status=200, headers={}, body=json.dumps(payload["rows"]).encode(), url=request.url)
+    return SimpleNamespace(status=404, headers={}, body=b"", url=request.url)
+# 这道核对针对 Windows 更新包。0.53.0 起检查按本机平台选包，在 macOS 上只认 DMG，所以明确按
+# Windows x64 客户端核对；更早的版本不分平台、只认 Windows 包，照原样调用。
+windows = ({"system": "win32", "machine": "AMD64"}
+           if "system" in inspect.signature(release_updates.check).parameters else {})
+release = release_updates.check(transport=transport, **windows)
 result = {"state": release.get("state"), "latest": release.get("latest_version"),
           "kind": release.get("package_kind"), "tools": sorted(update_packages.TOOL_PATHS)}
 if release.get("package_kind") != "full":

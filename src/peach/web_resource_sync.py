@@ -21,6 +21,8 @@ import re
 import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
+from .task_control import controlled
 from pathlib import Path, PureWindowsPath
 from typing import Callable, Protocol, Sequence
 
@@ -81,15 +83,19 @@ def configured_resource_locations() -> tuple[str, ...]:
                  if location in SCANNABLE_LOCATIONS and roots)
 
 
+@controlled
 def _scan_resource_directory(
     item: tuple[Path, dict[str, list[int]]],
 ) -> tuple[list[int], int]:
+    from .task_control import checkpoint
+    checkpoint()
     parent, expected = item
     present: set[str] = set()
     unreadable = 0
     try:
         with os.scandir(parent) as entries:
             for entry in entries:
+                checkpoint()
                 key = entry.name.casefold()
                 if key not in expected:
                     continue
@@ -143,7 +149,9 @@ def _missing_resource_ids(
             max_workers=min(RESOURCE_SCAN_WORKERS, len(directory_items)),
             thread_name_prefix="PeachResourceScan",
         ) as executor:
-            results = list(executor.map(_scan_resource_directory, directory_items))
+            futures = [executor.submit(copy_context().run, _scan_resource_directory, item)
+                       for item in directory_items]
+            results = [future.result() for future in futures]
     missing = [asset_id for ids, _unreadable in results for asset_id in ids]
     unreadable = sum(count for _ids, count in results)
     if unreadable_dirs is not None:
@@ -193,7 +201,10 @@ def _confirm_vanished(rows: Sequence) -> list:
     if not rows:
         return []
 
+    @controlled
     def present(row) -> bool:
+        from .task_control import checkpoint
+        checkpoint()
         try:
             return translate_ledger_path(row["path"]).exists()
         except OSError:
@@ -204,7 +215,8 @@ def _confirm_vanished(rows: Sequence) -> list:
         max_workers=min(RESOURCE_SCAN_WORKERS, len(rows)),
         thread_name_prefix="PeachVanishedCheck",
     ) as executor:
-        verdicts = list(executor.map(present, rows))
+        futures = [executor.submit(copy_context().run, present, row) for row in rows]
+        verdicts = [future.result() for future in futures]
     return [row for row, here in zip(rows, verdicts) if not here]
 
 
@@ -340,22 +352,30 @@ def _cache_owners(
     contract: ResourceSyncContract, excluded_ids: Sequence[int] = (),
     retired_ids: Sequence[int] = (),
 ) -> tuple[set[int], set[str], set[Path]]:
-    """缓存还有主人的三把键：按 id 认的、按番号认的、快照路径。
+    """缓存还有主人的三把键：按 id 认的、按封面键认的、快照路径。
 
     `excluded_ids` 是这一轮要永久删除的行，它们的缓存全都不算有主。`retired_ids` 是这一轮
     要标「已消失」的行，已经标过的也一样：快照与封面留给孤儿记录列表认片（ADR-0087），
     按 id 生成的转码、分片、时间轴与海报帧对一个读不到的文件没有用处，照孤儿清掉。
+
+    封面键除了馆藏的番号，还有没有番号的作品的 `ASSET-ID-<id>`，以及关注里没忽略的新作、
+    想要清单里还没入库的番号：库外这两类的封面由补封面装进同一个目录，详情页和卡片照样读。
     """
+    from .western_artwork import artwork_key
     with contract.read_connection() as connection:
         rows = connection.execute(
             "SELECT id,code,snapshot_path,disposal FROM asset WHERE COALESCE(disposal,'')!='trash'",
         ).fetchall()
+        outside = connection.execute(
+            "SELECT code FROM feed_discovery WHERE ignored_at IS NULL"
+            " UNION ALL SELECT code_key FROM want_item WHERE state<>'acquired'").fetchall()
     excluded = {int(item) for item in excluded_ids}
     retired = {int(item) for item in retired_ids}
     rows = [row for row in rows if int(row["id"]) not in excluded]
     active_ids = {int(row["id"]) for row in rows
                   if row["disposal"] is None and int(row["id"]) not in retired}
-    active_codes = {normalise_code_key(row["code"]) for row in rows if row["code"]}
+    active_codes = {artwork_key(int(row["id"]), row["code"]) for row in rows}
+    active_codes.update(normalise_code_key(row[0]) for row in outside if row[0])
     active_codes.discard("")
     translate = contract.snapshot_root is not None
     active_snapshots = {normalized_path(row["snapshot_path"]) if translate else Path(row["snapshot_path"])
@@ -462,10 +482,73 @@ def _resource_orphan_plan(
     }
 
 
+def _purged_cache_plan(contract: ResourceSyncContract, purged: Sequence[tuple[int, str | None]]) -> dict:
+    """只算这一次永久删除的资产留下的可重建产物，形状同 `_resource_orphan_plan`。
+
+    按 id 生成的文件与目录直接按名字认，只有海报帧与转码缓存要把各自目录列一次；快照随
+    账本行由 `_finish_purge` 删掉。封面按封面键认，还有别的行或库外清单用着就留下。
+    """
+    files: list[tuple[str, Path, int]] = []
+    cleanup_dirs: set[Path] = set()
+    ids = {int(asset_id) for asset_id, _code in purged}
+    if not ids or not contract.resource_cleanup_enabled:
+        return {"files": files, "dirs": cleanup_dirs}
+
+    def managed(root):
+        return root is not None and _managed_cache_root(contract, root) and root.is_dir()
+
+    for root, kind, pattern in (
+        (contract.poster_root, "posters", re.compile(r"^(\d+)_\d+\.jpg$")),
+        (contract.transcode_root, "transcodes", re.compile(r"^(\d+)-.+\.(?:mp4|mp4hdr)$")),
+    ):
+        if managed(root):
+            for path in root.iterdir():
+                match = pattern.match(path.name)
+                if match and int(match.group(1)) in ids and path.is_file():
+                    _cache_file(path, kind, files)
+    for root, kind in ((contract.photo_root, "photo-thumbs"), (contract.avatar_root, "asset-avatars")):
+        if managed(root):
+            for asset_id in ids:
+                if (root / f"{asset_id}.jpg").is_file():
+                    _cache_file(root / f"{asset_id}.jpg", kind, files)
+    from .timeline_sheets import sheet_dir
+    for root, kind, folder in ((contract.stream_root, "stream-segments", lambda root, asset_id: root / str(asset_id)),
+                               (contract.timeline_root, "timeline", sheet_dir)):
+        if managed(root):
+            for asset_id in ids:
+                directory = folder(root, asset_id)
+                if directory.is_dir():
+                    cleanup_dirs.add(directory)
+                    for path in directory.rglob("*"):
+                        if path.is_file():
+                            _cache_file(path, kind, files)
+    if managed(contract.cover_root):
+        from .western_artwork import artwork_key
+        _active_ids, active_codes, _snapshots = _cache_owners(contract)
+        for key in {artwork_key(int(asset_id), code) for asset_id, code in purged} - active_codes:
+            for name in (f"{key}.jpg", f"{key}.face.json", f"{key}{jav_poster_crop.SIDECAR_SUFFIX}"):
+                if (contract.cover_root / name).is_file():
+                    _cache_file(contract.cover_root / name, "covers", files)
+    return {"files": files, "dirs": cleanup_dirs}
+
+
+def clean_purged_caches(contract: ResourceSyncContract, purged: Sequence[tuple[int, str | None]]) -> dict:
+    """永久删除之后，只清这几部留下的可重建产物；回执形状同 `clean_resource_orphans`。
+
+    原先删完一批要把整个派生目录扫一遍（快照目录几万个文件），而这一步排在删除请求里。
+    其他原因留下的孤儿由资源同步那一轮的 `clean_resource_orphans` 兜底。
+    """
+    return _apply_cleanup(_purged_cache_plan(contract, purged))
+
+
 def clean_resource_orphans(contract: ResourceSyncContract, *, progress=None, checkpoint=None, resume_state=None) -> dict:
     if progress:
         progress(checked=0, total=None, message="正在核对可重建缓存清单")
-    plan = _resource_orphan_plan(contract)
+    return _apply_cleanup(_resource_orphan_plan(contract), progress=progress, checkpoint=checkpoint,
+                          resume_state=resume_state)
+
+
+def _apply_cleanup(plan: dict, *, progress=None, checkpoint=None, resume_state=None) -> dict:
     previous = (resume_state or {}).get('cache_checkpoint') or {}
     removed = previous.get('cache_removed', 0)
     reclaimed = previous.get('bytes_reclaimed', 0)

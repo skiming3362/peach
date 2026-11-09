@@ -375,6 +375,34 @@ class ApplyTests(unittest.TestCase):
         self.assertEqual((result['moved'], result['failed']), (0, 1))
         self.assertTrue(original.is_file())
 
+    def test_case_only_rename_updates_spelling_and_can_be_rolled_back(self):
+        self._file('old/abc-123.mp4')
+        original = r'R:\media\old\abc-123.mp4'
+        target = r'R:\media\old\ABC-123.mp4'
+        _seed(self.db_path, [dict(id=1, path=original, name='abc-123.mp4', code='ABC-123')])
+        plan = _plan(self.db_path, file_template='{number}')
+        result = self._apply(plan)
+        self.assertEqual((result['moved'], result['failed']), (1, 0))
+        self.assertEqual([path.name for path in (self.media / 'old').iterdir()], ['ABC-123.mp4'])
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(connection.execute('SELECT path,name FROM asset').fetchone(),
+                             (target, 'ABC-123.mp4'))
+            result = organize.rollback_batch(connection, organize.latest_batch(self.holder))
+            self.assertEqual((result['restored'], result['failed']), (1, 0))
+            self.assertEqual(connection.execute('SELECT path,name FROM asset').fetchone(),
+                             (original, 'abc-123.mp4'))
+        self.assertEqual([path.name for path in (self.media / 'old').iterdir()], ['abc-123.mp4'])
+
+    def test_case_only_move_committed_before_journal_is_not_renamed_again(self):
+        self._file('old/ABC-123.mp4')
+        original = r'R:\media\old\abc-123.mp4'
+        target = r'R:\media\old\ABC-123.mp4'
+        _seed(self.db_path, [dict(id=1, path=target, name='ABC-123.mp4', code='ABC-123')])
+        plan = {'rows': [dict(asset_id=1, action='rename', current_path=original, target_path=target)]}
+        with mock.patch.object(organize, '_rename', side_effect=AssertionError('已提交的行不应再次改名')):
+            result = self._apply(plan)
+        self.assertEqual((result['moved'], result['failed']), (1, 0))
+
     def test_scoped_symbol_cleanup_and_rollback_preserve_unselected_files(self):
         self._file('合集/★标题⧹⧹片段.mp4')
         self._file('合集2/★标题.mp4')
@@ -553,6 +581,21 @@ class EndpointTests(unittest.TestCase):
                 w_organize_preview(self.contract, body)
             with self.subTest(body=body), self.assertRaisesRegex(organize.OrganizeError, '整理路径'):
                 w_organize_apply(self.contract, {**body, 'confirm': True})
+
+    def test_a_scope_outside_the_source_is_a_bad_request_not_a_server_error(self):
+        """整理路径填错是参数问题：接口回 400 并带原因，不是 500。"""
+        from peach.api import create_app
+        from peach.config import PeachSettings
+        from support.web import route_client
+
+        app = create_app(PeachSettings(db_path=self.db_path, configured=True, token=""))
+        with route_client(app) as client:
+            for route in ("/api/organize/preview", "/api/organize/apply"):
+                with self.subTest(route=route):
+                    response = client.post(route, json={"location": "local", "path": r"S:\outside",
+                                                        "file_template": "{number}", "confirm": True})
+                    self.assertEqual(response.status_code, 400)
+                    self.assertIn("整理路径不在所选来源内", response.json()["error"])
 
     def test_apply_on_a_source_without_verified_rename_is_refused(self):
         from peach.web_organize import w_organize_apply

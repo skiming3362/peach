@@ -33,7 +33,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
 
-from .jobs import TaskRunConflict, process_alive
+from .jobs import TaskRunConflict, process_alive, process_matches
 from .repository import LedgerDatabase
 
 __all__ = [
@@ -50,6 +50,8 @@ ACTIVE_STATUSES = ("pending", "running")
 #: 终态。只有这四种能进 `finish`，也只有这四种会被 `prune` 回收。
 TERMINAL_STATUSES = ("succeeded", "failed", "cancelled", "interrupted")
 TRIGGERS = ("manual", "scheduled", "startup", "cli")
+#: 任务中心列表每轮下发的已结束后继条数上限，见 `settled_followups`。
+SETTLED_FOLLOWUP_LIMIT = 50
 
 #: 心跳超过这么久没续，且进程也不在了，就按被打断处理。
 #: 取 5 分钟不是因为任务不会更久——单项外部动作的预算是 240 秒（`library_processing`
@@ -93,28 +95,35 @@ TASK_LABELS = {
     "resource-apply": "资源同步清理",
     "scraping-cover": "封面采集",
     "media-repair": "媒体修复",
+    "mp4-header-repair": "播放文件头修复",
+    'jav-discovery-metadata': '发现页资料读取',
+    'diagnostic-export': '诊断导出',
+    "ledger-backup": "账本备份",
+    "ledger-restore": "从备份恢复账本",
     "upgrade-repairs": "自动修复",
-    "upgrade-library": "自动修复资料",
+    "upgrade-library": "资料自动修复",
+    "follow-evidence-reclaim": "关注旧快照清理",
     "organize": "按模板整理",
     "batch": "批量操作",
     "scrape-codes": "番号资料刮削",
     "jav-covers": "封面批量抓取",
-    "entity-avatar": "补全资料图片",
-    "performer-profile": "补全女优资料",
-    "performer-alias": "补全女优别名",
-    "studio-mark": "补厂牌官网与标识",
-    "creator-identity": "查创作者身份",
-    "code-samples": "补番号样张",
+    "entity-avatar": "资料图片补全",
+    "performer-profile": "女优资料补全",
+    "performer-alias": "女优别名补全",
+    "studio-mark": "厂牌官网与标识补全",
+    "creator-identity": "创作者身份查找",
+    "code-samples": "番号样张采集",
     "feed-check": "订阅源拉取",
-    "feed-scrape": "取新作资料",
-    "feed-cover": "补新作封面",
-    "want-scrape": "取想要的资料",
+    "feed-scrape": "新作资料采集",
+    "feed-cover": "新作封面采集",
+    "want-scrape": "想要作品资料采集",
     "timeline-thumbnails": "视频缩略图采集",
     "download-postprocess": "云下载后处理",
-    "seed-import": "导入初始资料",
+    "seed-import": "初始资料导入",
     "follow-creator": "关注作者建档",
-    "amane-bridge": "重建 amane 桥",
-    "face-models": "下载人脸模型",
+    "amane-bridge": "amane 桥重建",
+    "source-check": "资料源连接检查",
+    "face-models": "人脸模型下载",
 }
 
 
@@ -274,7 +283,8 @@ class TaskRunStore:
 
     def start(self, task_key: str, *, trigger: str, mutex_key: str | None = None,
               conflict: str = "skip", total: int | None = None,
-              label: str = "", pid: int | None = None) -> TaskRun | None:
+              label: str = "", pid: int | None = None,
+              summary: dict | None = None) -> TaskRun | None:
         from .update_tasks import admission
         with admission(self.database.db_path):
             from .job_recovery import current_run
@@ -282,7 +292,8 @@ class TaskRunStore:
             if resumed is not None:
                 return resumed
             return self._start(task_key, trigger=trigger, mutex_key=mutex_key,
-                               conflict=conflict, total=total, label=label, pid=pid)
+                               conflict=conflict, total=total, label=label, pid=pid,
+                               summary=summary)
 
     def suspend(self, run_id: int, *, label: str = '等待安装完成后继续',
                 paused_for_update: bool = True) -> None:
@@ -307,8 +318,11 @@ class TaskRunStore:
 
     def _start(self, task_key: str, *, trigger: str, mutex_key: str | None = None,
                conflict: str = "skip", total: int | None = None,
-               label: str = "", pid: int | None = None) -> TaskRun | None:
+               label: str = "", pid: int | None = None,
+               summary: dict | None = None) -> TaskRun | None:
         """开一轮。互斥冲突时按 `conflict` 处理，返回 None 或抛 `TaskRunConflict`。
+
+        `summary` 是开跑时就知道的那部分摘要，例如这一轮处理的是哪部作品；结算时由最终摘要替换。
 
         `conflict="skip"` 是定时触发的语义：本轮不跑，但要留下一条记录说明被谁挡了。
         `conflict="raise"` 是手动触发的语义：告诉用户是哪一轮挡着，让他自己决定。
@@ -326,10 +340,12 @@ class TaskRunStore:
                     "INSERT INTO task_run(task_key,trigger,status,mutex_key,pid,host,"
                     "started_at,heartbeat_at,progress_current,progress_total,"
                     "progress_label,result_summary) "
-                    "VALUES(?,?,'running',?,?,?,?,?,0,?,?,'{}')",
+                    "VALUES(?,?,'running',?,?,?,?,?,0,?,?,?)",
                     (task_key, trigger, mutex_key, pid if pid is not None else os.getpid(),
-                     self.host, moment, moment, total, label))
+                     self.host, moment, moment, total, label, json.dumps(summary or {}, ensure_ascii=False)))
                 run_id = int(cursor.lastrowid)
+                from .task_control import initialize_speed
+                initialize_speed(self, run_id)
         except sqlite3.IntegrityError:
             if mutex_key is None:
                 # 没声明互斥还撞上约束，说明坏的是别的东西（CHECK、列约束），
@@ -482,7 +498,9 @@ class TaskRunStore:
             planned = planned[:MAX_FOLLOWUPS]
         root = parent.root_run_id or parent.id
         moment = stamp()
-        with self.database.write_transaction(notify=False) as connection:
+        from .task_control import initialize_speed
+        from .update_tasks import gate, state_for
+        with gate(state_for(self.database.db_path)), self.database.write_transaction(notify=False) as connection:
             # 父任务是裸任务时它就是这条链的根。补在这里而不是 `start`：开工那一刻还
             # 不知道这一轮会不会派后继，给每一行都填一个指向自己的 root 是无意义的噪声。
             connection.execute(
@@ -501,7 +519,9 @@ class TaskRunStore:
                     # 活跃互斥索引拦下的：同一件事已经在排队或在跑，这一条不必再排。
                     result["duplicates"] += 1
                     continue
-                result["queued"].append(int(cursor.lastrowid))
+                run_id = int(cursor.lastrowid)
+                initialize_speed(self, run_id, parent)
+                result["queued"].append(run_id)
         return result
 
     def continue_followup(self, run: TaskRun, label: str = "") -> int | None:
@@ -513,7 +533,9 @@ class TaskRunStore:
         """
         if not self.enabled or not run.followup_key:
             return None
-        with self.database.write_transaction(notify=False) as connection:
+        from .task_control import initialize_speed
+        from .update_tasks import gate, state_for
+        with gate(state_for(self.database.db_path)), self.database.write_transaction(notify=False) as connection:
             try:
                 cursor = connection.execute(
                     "INSERT INTO task_run(task_key,trigger,status,mutex_key,pid,host,"
@@ -525,13 +547,18 @@ class TaskRunStore:
                      run.followup_depth))
             except sqlite3.IntegrityError:
                 return None
-        return int(cursor.lastrowid)
+            run_id = int(cursor.lastrowid)
+            initialize_speed(self, run_id, run)
+        return run_id
 
     def claim_followup(self, task_keys, first=()) -> TaskRun | None:
-        from .update_tasks import admission, UpdateBusy
+        """装更新期间返回 None；闸门锁被别人拿着时抛 `GateBusy`，调用方稍后再领。"""
+        from .update_tasks import admission, GateBusy, UpdateBusy
         try:
             with admission(self.database.db_path):
                 return self._claim_followup(task_keys, first)
+        except GateBusy:
+            raise
         except UpdateBusy:
             return None
 
@@ -546,13 +573,24 @@ class TaskRunStore:
             return None
         ahead = tuple(dict.fromkeys(str(key) for key in first or ())) or ("",)
         marks = ",".join("?" * len(keys))
+        from .task_control import requested
         moment = stamp()
         with self.database.write_transaction(notify=False) as connection:
-            row = connection.execute(
-                f"SELECT id FROM task_run WHERE followup_key IS NOT NULL "
+            rows = connection.execute(
+                f"SELECT id,parent_run_id,root_run_id FROM task_run WHERE followup_key IS NOT NULL "
                 f"AND status='pending' AND task_key IN ({marks}) "
-                f"ORDER BY task_key IN ({','.join('?' * len(ahead))}) DESC, id LIMIT 1",
-                (*keys, *ahead)).fetchone()
+                f"ORDER BY task_key IN ({','.join('?' * len(ahead))}) DESC, id",
+                (*keys, *ahead)).fetchall()
+            row = None
+            for candidate in rows:
+                action = requested(self.database.db_path, candidate['id'],
+                                   (candidate['parent_run_id'], candidate['root_run_id']))
+                if action == 'cancel':
+                    connection.execute("UPDATE task_run SET status='cancelled',finished_at=?,heartbeat_at=? "
+                                       "WHERE id=? AND status='pending'", (moment, moment, candidate['id']))
+                elif action != 'pause':
+                    row = candidate
+                    break
             if row is None:
                 return None
             run_id = int(row["id"])
@@ -583,12 +621,22 @@ class TaskRunStore:
                 (stamp(),))
         return [int(row["id"]) for row in rows]
 
-    def children(self, parent_run_id: int) -> list[TaskRun]:
-        """这一轮派出的后继，按入队顺序。"""
+    def children(self, parent_run_id: int, *, limit: int | None = None) -> list[TaskRun]:
+        """这一轮派出的后继，按入队顺序。
+
+        给了 `limit` 只取最近派出的那么多条，正在跑的另外一条不落：后继按 id 顺序认领，在跑的那条
+        往往是最早的，按 id 取最近几条只剩排队的。总数看 `followup_counts`。
+        """
         with self.database.read_connection() as connection:
-            rows = connection.execute(
-                f"SELECT {_COLUMNS} FROM task_run WHERE parent_run_id=? ORDER BY id",
-                (int(parent_run_id),)).fetchall()
+            if limit is None:
+                rows = connection.execute(
+                    f"SELECT {_COLUMNS} FROM task_run WHERE parent_run_id=? ORDER BY id",
+                    (int(parent_run_id),)).fetchall()
+            else:
+                rows = connection.execute(
+                    f"SELECT {_COLUMNS} FROM task_run WHERE parent_run_id=? AND (status='running' OR id IN ("
+                    "SELECT id FROM task_run WHERE parent_run_id=? ORDER BY id DESC LIMIT ?)) ORDER BY id",
+                    (int(parent_run_id), int(parent_run_id), max(1, int(limit)))).fetchall()
         return [_row(row) for row in rows]
 
     def _due(self, run_id: int, throttle: float) -> bool:
@@ -641,7 +689,7 @@ class TaskRunStore:
                     continue
             local = run.host == self.host
             alive = (local and run.pid is not None and run.pid != os.getpid()
-                     and process_alive(run.pid))
+                     and process_matches(run.pid, run.heartbeat_at or run.started_at, alive=process_alive))
             beat = _parse(run.heartbeat_at) or _parse(run.started_at)
             expired = beat is None or beat < deadline
             if alive or (not local and not expired):
@@ -657,25 +705,35 @@ class TaskRunStore:
                 recovered.append(run.id)
         return recovered
 
-    def prune(self, task_key: str, keep: int = DEFAULT_KEEP) -> int:
+    def prune(self, task_key: str, keep: int = DEFAULT_KEEP, *, keep_errors: bool = False) -> int:
         """每个 task_key 只留最近 `keep` 条终态记录，返回删掉多少条。
 
         活跃任务保留，指向已清退历史的父任务和根任务关联由删除触发器置空。
+        随后清退整个数据根里已结束运行的控制文件（`task_control.prune_controls`），不限本 task_key。
+        后继使用 `keep_errors` 保留仍可重试的失败项；下载状态保留并清空已清退运行的链接。
         阈值用 `LIMIT 1 OFFSET keep` 取「第 keep+1 新的那条 id」。
         """
         if not self.enabled or keep < 0:
             return 0
-        marks = ",".join(f"'{name}'" for name in TERMINAL_STATUSES)
+        states = ('succeeded', 'cancelled') if keep_errors else TERMINAL_STATUSES
+        marks = ",".join(f"'{name}'" for name in states)
+        removed = 0
         with self.database.write_transaction(notify=False) as connection:
             threshold = connection.execute(
                 f"SELECT id FROM task_run WHERE task_key=? AND status IN ({marks}) "
                 "ORDER BY id DESC LIMIT 1 OFFSET ?", (task_key, keep)).fetchone()
-            if threshold is None:
-                return 0
-            cursor = connection.execute(
-                f"DELETE FROM task_run WHERE task_key=? AND status IN ({marks}) "
-                "AND id<=?", (task_key, threshold["id"]))
-        return cursor.rowcount
+            if threshold is not None:
+                connection.execute(
+                    "UPDATE download_task SET postprocess_run_id=NULL WHERE postprocess_run_id IN ("
+                    f"SELECT id FROM task_run WHERE task_key=? AND status IN ({marks}) AND id<=?)",
+                    (task_key, threshold["id"]))
+                cursor = connection.execute(
+                    f"DELETE FROM task_run WHERE task_key=? AND status IN ({marks}) "
+                    "AND id<=?", (task_key, threshold["id"]))
+                removed = cursor.rowcount
+        from .task_control import prune_controls
+        prune_controls(self)
+        return removed
 
     # -- 查询 --------------------------------------------------------------
 
@@ -684,6 +742,52 @@ class TaskRunStore:
             row = connection.execute(
                 f"SELECT {_COLUMNS} FROM task_run WHERE id=?", (run_id,)).fetchone()
         return _row(row) if row else None
+
+    def active_descendants(self, run_id: int, *, limit: int | None = None) -> list[TaskRun]:
+        """还在排或在跑的全部后代（不含自己），一条查询取回整行。
+
+        一轮补全能派出上千条后继；逐条 `get` 每条都开一次连接，任务中心每次轮询都要等好几秒。
+        只想知道有没有时给 `limit=1`。
+        """
+        sql = ("WITH RECURSIVE family(id) AS (SELECT id FROM task_run WHERE parent_run_id=? "
+               "UNION ALL SELECT t.id FROM task_run t JOIN family f ON t.parent_run_id=f.id) "
+               f"SELECT {_COLUMNS} FROM task_run WHERE id IN (SELECT id FROM family) "
+               "AND status IN ('pending','running') ORDER BY id")
+        params: tuple = (run_id,)
+        if limit is not None:
+            sql += " LIMIT ?"
+            params += (limit,)
+        with self.database.read_connection() as connection:
+            rows = connection.execute(sql, params).fetchall()
+        return [_row(row) for row in rows]
+
+    def active_families(self) -> dict[int, list[tuple[int, str]]]:
+        """每条自己或后代还在排在跑的任务 → 这一族里在排在跑的 `(id, status)`（含自己），按 id 排。
+
+        键与 `live_ids` 相同。任务中心一页里每条在跑的任务都要问「族里谁还活着」：逐条递归查询、
+        逐条开连接，几千条排队后继时一次轮询要好几秒；这里一条查询沿父链往上一次取齐。
+        """
+        families: dict[int, list[tuple[int, str]]] = {}
+        with self.database.read_connection() as connection:
+            for ancestor, run_id, status in connection.execute(
+                    "WITH RECURSIVE up(ancestor, id, status) AS ("
+                    "SELECT id, id, status FROM task_run WHERE status IN ('pending','running') "
+                    "UNION SELECT t.parent_run_id, u.id, u.status FROM task_run t JOIN up u ON t.id=u.ancestor "
+                    "WHERE t.parent_run_id IS NOT NULL) SELECT ancestor, id, status FROM up ORDER BY ancestor, id"):
+                families.setdefault(int(ancestor), []).append((int(run_id), status))
+        return families
+
+    def live_ids(self) -> set[int]:
+        """自己或某个后代还在排或在跑的任务：在排在跑的那些，连同它们沿父链往上的每一层。
+
+        任务中心一页两百来条，绝大多数早已结束、后代也都结束了；先一条查询圈出这一份，
+        不在里面的就不必逐条再问控制状态与资源占用。
+        """
+        with self.database.read_connection() as connection:
+            return {int(row[0]) for row in connection.execute(
+                "WITH RECURSIVE live(id) AS (SELECT id FROM task_run WHERE status IN ('pending','running') "
+                "UNION SELECT t.parent_run_id FROM task_run t JOIN live l ON t.id=l.id "
+                "WHERE t.parent_run_id IS NOT NULL) SELECT id FROM live")}
 
     def blocking(self, mutex_key: str) -> TaskRun | None:
         """当前占着这把锁的那一轮。冲突时用它回答「是谁挡的」。"""
@@ -718,8 +822,21 @@ class TaskRunStore:
                 [*values, max(1, min(int(limit), 500))]).fetchall()
         return [_row(row) for row in rows]
 
+    @staticmethod
+    def _finished_condition() -> str:
+        marks = ",".join(f"'{name}'" for name in TERMINAL_STATUSES)
+        active = ",".join(f"'{name}'" for name in ACTIVE_STATUSES)
+        return (f"t.status IN ({marks}) AND (t.parent_run_id IS NULL OR NOT EXISTS "
+                "(SELECT 1 FROM task_run p WHERE p.id=t.parent_run_id)) AND NOT EXISTS "
+                f"(SELECT 1 FROM task_run c WHERE c.parent_run_id=t.id AND c.status IN ({active}))")
+
+    def finished_count(self) -> int:
+        with self.database.read_connection() as connection:
+            return connection.execute(
+                f"SELECT count(*) FROM task_run t WHERE {self._finished_condition()}").fetchone()[0]
+
     def finished_page(self, *, before: tuple[str, int] | None = None,
-                      limit: int = 50) -> tuple[list[TaskRun], bool]:
+                      limit: int = 50, offset: int = 0) -> tuple[list[TaskRun], bool]:
         """终态行按结束时刻从新到旧取一页，返回这一页和它后面还有没有更早的。
 
         排序键是 `(finished_at, id)` 而不是 `id`：开跑早、结束晚的长任务按 id 会落进
@@ -735,11 +852,7 @@ class TaskRunStore:
         自动修复每分钟派一批，它们留在这里会占满第一页，「最近完成」就只剩一个「加载更早」。
         """
         size = max(1, min(int(limit), 500))
-        marks = ",".join(f"'{name}'" for name in TERMINAL_STATUSES)
-        active = ",".join(f"'{name}'" for name in ACTIVE_STATUSES)
-        where = (f"t.status IN ({marks}) AND (t.parent_run_id IS NULL OR NOT EXISTS "
-                 "(SELECT 1 FROM task_run p WHERE p.id=t.parent_run_id)) AND NOT EXISTS "
-                 f"(SELECT 1 FROM task_run c WHERE c.parent_run_id=t.id AND c.status IN ({active}))")
+        where = self._finished_condition()
         values: list[object] = []
         if before is not None:
             where += " AND (t.finished_at<? OR (t.finished_at=? AND t.id<?))"
@@ -748,12 +861,17 @@ class TaskRunStore:
         with self.database.read_connection() as connection:
             rows = connection.execute(
                 f"SELECT {columns} FROM task_run t WHERE {where} "
-                "ORDER BY t.finished_at DESC, t.id DESC LIMIT ?", [*values, size + 1]).fetchall()
+                "ORDER BY t.finished_at DESC, t.id DESC LIMIT ? OFFSET ?",
+                [*values, size + 1, max(0, int(offset))]).fetchall()
         page = [_row(row) for row in rows[:size]]
         return page + self.settled_followups([run.id for run in page]), len(rows) > size
 
-    def settled_followups(self, root_ids) -> list[TaskRun]:
-        """这几轮派出的、已经结束的后继，整条链上的都算。"""
+    def settled_followups(self, root_ids, *, limit: int | None = None) -> list[TaskRun]:
+        """这几轮派出的、已经结束的后继，整条链上的都算；每轮只取最近 `limit` 条。
+
+        任务中心有任务在跑时每两秒取一次，一轮派出上千条后继时不设上限就是每两秒几千行。
+        总数与失败数看 `followup_counts`，卡片展开时再按父任务取全（`/api/tasks/{id}`）。
+        """
         ids = [int(run_id) for run_id in root_ids]
         if not self.enabled or not ids:
             return []
@@ -761,9 +879,11 @@ class TaskRunStore:
         holes = ",".join("?" * len(ids))
         with self.database.read_connection() as connection:
             rows = connection.execute(
-                f"SELECT {_COLUMNS} FROM task_run WHERE root_run_id IN ({holes}) "
-                f"AND id NOT IN ({holes}) AND status IN ({marks}) ORDER BY id",
-                [*ids, *ids]).fetchall()
+                f"SELECT {_COLUMNS} FROM (SELECT *, ROW_NUMBER() OVER ("
+                "PARTITION BY root_run_id ORDER BY id DESC) AS recent FROM task_run "
+                f"WHERE root_run_id IN ({holes}) AND id NOT IN ({holes}) AND status IN ({marks})) "
+                "WHERE recent<=? ORDER BY id",
+                [*ids, *ids, max(1, int(SETTLED_FOLLOWUP_LIMIT if limit is None else limit))]).fetchall()
         return [_row(row) for row in rows]
 
     def active_parents(self) -> list[TaskRun]:
@@ -813,9 +933,14 @@ class TaskRunStore:
                          conflict=conflict, total=total, label=label)
         handle = TaskRunHandle(self, run.id if run else None)
         try:
-            yield handle
+            from .task_control import bind, checkpoint
+            with bind(self, handle.run_id):
+                yield handle
+                checkpoint()
         except BaseException as error:
-            handle.finish("failed", error=f"{type(error).__name__}: {error}")
+            from .task_control import Cancelled
+            handle.finish('cancelled' if isinstance(error, Cancelled) else 'failed',
+                          error='' if isinstance(error, Cancelled) else f"{type(error).__name__}: {error}")
             raise
         else:
             handle.finish("succeeded")
@@ -885,6 +1010,8 @@ class TaskRunHandle:
 
     def checkpoint(self, **fields) -> None:
         """领域结果提交后保存完成集合；后继重新领取时沿用。"""
+        from .task_control import checkpoint
+        checkpoint()
         if self.run_id is None or not self.store.enabled:
             return
         with self.store.database.write_transaction(notify=False) as connection:
@@ -899,10 +1026,14 @@ class TaskRunHandle:
     def progress(self, current: int | None = None, total: int | None = None,
                  label: str | None = None, *,
                  throttle: float = PROGRESS_INTERVAL) -> None:
+        from .task_control import checkpoint
+        checkpoint()
         self.store.progress(self.run_id, current=current, total=total,
                             label=label, throttle=throttle)
 
     def heartbeat(self) -> None:
+        from .task_control import checkpoint
+        checkpoint()
         self.store.heartbeat(self.run_id)
 
     def finish(self, status: str, *, summary: dict | None = None,

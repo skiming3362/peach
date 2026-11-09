@@ -198,15 +198,19 @@ class FetchRetryTests(unittest.TestCase):
                 covers.best_cover(transport, code, 0)
 
     def test_a_spent_run_budget_stops_before_trying_another_candidate(self):
-        from peach.scraping_access import SourceTransport
+        from peach.scraping_access import BUDGET_SPENT, SourceTransport
         candidates = tuple(covers.candidate_for(f'https://{name}.example/cover.jpg')
                            for name in ('first', 'second'))
         with tempfile.TemporaryDirectory() as directory:
             transports = [SourceTransport(Path(directory), max_requests=1),
                           SourceTransport(Path(directory), max_bytes=1),
                           SourceTransport(Path(directory), max_seconds=1)]
+            self.assertEqual([transport.exhausted() for transport in transports], ['', '', ''])
             transports[0].requests = transports[1].bytes = 1
             transports[2].deadline = time.monotonic() - 1
+            # 到顶与否不必发一问去撞：处理任务据此整趟停下（#513）。
+            self.assertEqual([covers.HostLimitedTransport(transport, 0).exhausted() for transport in transports],
+                             [BUDGET_SPENT['requests'], BUDGET_SPENT['bytes'], BUDGET_SPENT['seconds']])
             for transport in transports:
                 for code in ('FC2-PPV-123456', 'ABW-192', 'SSIS-057'):
                     with self.subTest(transport=transport, code=code), \
@@ -774,7 +778,7 @@ class CrossProductCoverTests(unittest.TestCase):
             "https://contents-thumbnail2.fc2.com/w1200/storage/x.jpg"))
 
     def test_dmm_content_id_must_carry_the_code_number(self):
-        # 字母段对上、数字段不对：MIB 的 `YUJ-101` 取回 `yuj00011`，`435MFC-135` 取回
+        # 字母段对上、数字段不对：`YUJ-101` 取回 `yuj00011`，`435MFC-135` 取回
         # `mfcc00027`。954 条成功记录里，这样的正好 9 条，全是错图。
         for code, cid in (("YUJ-101", "yuj00011"), ("CHU-201", "chu00021"),
                           ("435MFC-135", "h_1711mfcc00027")):
@@ -787,6 +791,12 @@ class CrossProductCoverTests(unittest.TestCase):
             with self.subTest(code=code):
                 self.assertFalse(covers.is_cross_product_cover(
                     code, f"https://pics.dmm.co.jp/mono/movie/{cid}/{cid}pl.jpg"))
+
+    def test_dmm_padding_does_not_cross_a_registered_short_serial(self):
+        # #296：DMM 的 `mcdv00024` 是クリスタル映像的有码 `MCDV-024`，不是无码的 `MCDV-24`。
+        url = "https://pics.dmm.co.jp/mono/movie/mcdv00024/mcdv00024pl.jpg"
+        self.assertTrue(covers.is_cross_product_cover("MCDV-24", url))
+        self.assertFalse(covers.is_cross_product_cover("MCDV-024", url))
 
     def test_an_fc2_image_named_after_another_work_is_cross_product(self):
         # JavArchive 图床的文件名就是作品号；十位的 `1654160016` 是上传时间戳，说明不了归属。
@@ -898,7 +908,7 @@ class KoreanMibCoverTests(unittest.TestCase):
             connection.execute("CREATE TABLE asset(code TEXT, medium TEXT, location TEXT)")
             connection.executemany(
                 "INSERT INTO asset(code,medium,location) VALUES(?, 'video', '115')",
-                [("ABW-232",), ("HA-101",), ("YUJ-101",)],
+                [("ABW-232",), ("HA-101",), ("AIN-101",)],
             )
             connection.commit(); connection.close()
             for only_shaped in (True, False):

@@ -31,6 +31,34 @@ class FollowScheduleStoreTests(unittest.TestCase):
 
 
 class FollowUpdateSchedulerTests(unittest.TestCase):
+    def test_restart_preserves_failed_checks_and_the_backoff_deadline(self):
+        failure = lambda: {'checked': 1, 'results': [{'ok': False}]}
+        with tempfile.TemporaryDirectory() as temporary:
+            first = FollowUpdateScheduler(Path(temporary), failure, available=True)
+            first.start()
+            try:
+                first._run()
+                first._run()
+                previous = first.status()
+            finally:
+                first.stop()
+            second = FollowUpdateScheduler(Path(temporary), failure, available=True)
+            second.start()
+            try:
+                current = second.status()
+                self.assertEqual(current['consecutive_failures'], 2)
+                self.assertEqual(current['last_error'], previous['last_error'])
+                self.assertEqual(current['failing_since'], previous['failing_since'])
+                self.assertEqual(current['next_run_at'], previous['next_run_at'])
+                second.run_check = lambda: {'checked': 1, 'results': [{'ok': True}]}
+                second._run()
+            finally:
+                second.stop()
+            third = FollowUpdateScheduler(Path(temporary), failure, available=True)
+            self.assertEqual(third.status()['consecutive_failures'], 0)
+            self.assertIsNone(third.status()['last_error'])
+            self.assertIsNone(third.status()['failing_since'])
+
     def test_installation_reservation_skips_the_tick_without_recording_a_failure(self):
         from peach.update_tasks import UpdateBusy
         def blocked():
@@ -195,6 +223,38 @@ class FollowUpdateSchedulerTests(unittest.TestCase):
             self.assertIsNotNone(next_run)
             self.assertGreater(datetime.fromisoformat(next_run), planned,
                                "连续失败后应当推后，而不是照原间隔继续敲上游")
+
+    def test_a_tick_shorter_than_the_period_runs_often_and_backs_off_from_the_tick(self):
+        """订阅源：设置里的间隔是每个源的周期，调度按更短的一跳看谁到期（ADR-0134）。"""
+        with tempfile.TemporaryDirectory() as temporary:
+            scheduler = FollowUpdateScheduler(
+                Path(temporary), lambda: {"ok": True, "checked": 0, "results": []},
+                available=True, default=FollowScheduleConfig(True, 360), tick_minutes=30)
+            self.addCleanup(scheduler.stop)
+            before = datetime.now(timezone.utc)
+            scheduler.start()
+            status = scheduler.status()
+            self.assertEqual(status["interval_minutes"], 360)
+            self.assertLess(datetime.fromisoformat(status["next_run_at"]),
+                            before + timedelta(minutes=31))
+            self.assertEqual(scheduler.backoff_minutes(2), 60)
+
+    def test_an_idle_tick_keeps_the_last_failure_on_record(self):
+        """没有到期源的一跳什么也没做：上一轮的失败、连续失败计数和上次运行时间都留着。"""
+        outcomes = [{"ok": True, "checked": 1, "results": [{"ok": False, "added": 0}]},
+                    {"ok": True, "idle": True, "checked": 0, "results": []}]
+        with tempfile.TemporaryDirectory() as temporary:
+            scheduler = FollowUpdateScheduler(Path(temporary), lambda: outcomes.pop(0),
+                                              available=True, tick_minutes=30)
+            scheduler._run()
+            failed = scheduler.status()
+            scheduler._run()
+            status = scheduler.status()
+            self.assertEqual(status["last_error"], "1 个来源检查失败")
+            self.assertEqual(status["consecutive_failures"], 1)
+            self.assertEqual((status["last_started_at"], status["last_finished_at"], status["last_checked"]),
+                             (failed["last_started_at"], failed["last_finished_at"], 1))
+            self.assertFalse(status["running"])
 
     def test_reader_never_starts_or_accepts_schedule_changes(self):
         with tempfile.TemporaryDirectory() as temporary:

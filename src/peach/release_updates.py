@@ -1,18 +1,25 @@
-"""公开测试版查询；传输复用共享 HTTPX，发行包从 GitHub Releases 取。
+"""公开测试版查询；传输复用共享 HTTPX，发行包从自己的 fork 的 GitHub Releases 取。
 
-这份检出发的是本机自用的修改版，所以更新源指向自己的 fork，不是上游
-`peach-mitao/peach`：上游发新版时本机不该被它带走，只有 fork 上挂出带制品的发布才会被
-检查到。制品由 `scripts/package_windows_release.py` 打，`state/project-context/
-publish-release.ps1` 负责挂到 fork 的 release 上。上游另有 `downloads.peach.video` 这个
-镜像源，fork 没有对应服务，这里不再保留第二个源。
+这份检出是本机自用的修改版，所以更新源指向自己的 fork，不是上游 `peach-mitao/peach`：
+上游发新版时本机不该被它带走，只有 fork 上挂出带制品的发布才会被检查到。制品由
+`scripts/package_windows_release.py` 打，`state/project-context/publish-release.ps1` 负责
+挂到 fork 的 release 上。
+
+上游另有 `downloads.peach.video` 这个镜像源。fork 没有对应服务，所以它不参与发行列表：
+列表里挂的是上游的包，一旦参与判断，上游发的新版就会提示本机升级，等于把本机交回上游。
+镜像只留作**同一版本、同一文件名**的下载备份（`download_sources`），下载时两个源的字节都要
+对上发布条目给的摘要。
 """
 from __future__ import annotations
 
 import json
+import platform
 import re
+import sys
+
 import httpx
 
-from . import __version__, distribution
+from . import __version__, distribution, docker_update
 from .http import HttpRequest, HttpxTransport
 from .update_packages import TOOL_PATHS
 
@@ -20,16 +27,42 @@ from .update_packages import TOOL_PATHS
 REPOSITORY = "skiming3362/peach"
 RELEASES_URL = f"https://github.com/{REPOSITORY}/releases"
 API_URL = f"https://api.github.com/repos/{REPOSITORY}/releases?per_page=100"
+#: 上游的公开镜像。fork 没有对应服务，只作同版本下载备份，不参与发行列表。
+DOWNLOADS_BASE = "https://downloads.peach.video"
+LISTING_RULE = 'source-aware-v1'
 
 
 def download_sources(url: str) -> tuple[str, ...]:
-    """发行包的下载地址。只剩 GitHub 一个来源，保留成列表是为了让调用方不必改形状。"""
+    """发行包保留同版本、同文件名的另一公开源；校验沿用原发布摘要。
+
+    主源一律是本 fork 的发布地址（`_release_candidates` 只按它拼地址），备份是上游镜像上
+    同版本同文件名的那个文件。反过来也认：手动粘进来的镜像地址能退回发布页。镜像上没有
+    这个版本时备份返回 404，主源的校验失败仍然如实报出来（`standalone_update.download`）。
+    """
+    github = RELEASES_URL + "/download/"
+    mirror = DOWNLOADS_BASE + "/"
+    for primary, backup in ((github, mirror), (mirror, github)):
+        if url.startswith(primary):
+            return url, backup + url.removeprefix(primary)
     return (url,)
 
 
+#: 容器换新版在宿主机上做：拉镜像、重建容器，`/data` 卷保留。每步一句说明加一条命令，
+#: 命令按仓库的 compose.yaml 写（镜像标签取 `.env` 的 `PEACH_VERSION`，缺省是 `edge`）。
+DOCKER_STEPS = (
+    ("在 compose.yaml 所在目录拉取新镜像；.env 里把 PEACH_VERSION 固定成版本号的，先改成新版本",
+     "docker compose pull"),
+    ("重建容器，/data 数据卷保留", "docker compose up -d"),
+)
+
+
 def snapshot() -> dict:
+    docker = distribution.docker()
+    installation = "Docker 镜像" if docker else "独立测试包" if distribution.standalone() else "源码运行"
     return {"current_version": __version__, "latest_version": None,
-            "channel": "测试版", "installation": "独立测试包" if distribution.standalone() else "源码运行",
+            "channel": "测试版", "installation": installation,
+            "in_app_update": distribution.in_app_update(),
+            "steps": [{"text": text, "command": command} for text, command in DOCKER_STEPS] if docker else [],
             "state": "unchecked", "message": "尚未检查", "release_url": RELEASES_URL}
 
 
@@ -39,12 +72,13 @@ def _version(value: object) -> tuple[int, ...] | None:
     return tuple(map(int, value.removeprefix("v").split(".")))
 
 
-def _release_candidates(rows: list) -> list[tuple]:
-    """从 GitHub 的发行列表里挑出完整包，并构造受信任的下载地址。
+def _release_candidates(rows: list, system: str = "win32", machine: str = "") -> list[tuple]:
+    """从发行的发布列表选择本机平台的完整包，并构造受信任的下载地址。
 
-    只认带全套工具包的那一版更新包：缺工具包时只下完整包，靠它补齐工具。下载地址一律
-    由这里按 tag 和资产名拼出来，不采信发行条目里的 `browser_download_url`——那是发布者
-    可以随手填的字段，摘要才是校验依据。
+    macOS 选与本机架构同名的 DMG（`build_macos_standalone.py` 按 `platform.machine()` 命名），
+    没有分包与工具包；其余平台沿用 Windows 包判断有无新版本。下载地址一律由这里按 tag 和
+    资产名拼出来，不采信发行条目里的 `browser_download_url`——那是发布者可以随手填的字段，
+    摘要才是校验依据。
     """
     releases = []
     for row in rows:
@@ -55,48 +89,100 @@ def _release_candidates(rows: list) -> list[tuple]:
             continue
         tag = row["tag_name"]
         assets = row.get("assets") or []
-        prefix = f"Peach-{tag.removeprefix('v')}-windows-x64"
         uploaded = {a.get("name"): a for a in assets if isinstance(a, dict) and a.get("state") == "uploaded"}
-        full = uploaded.get(prefix + ".zip")
-        if full is None:
-            continue
-        complete_tools = all(prefix + f"-tools-{tool}.zip" in uploaded for tool in TOOL_PATHS)
-        asset = uploaded.get(prefix + "-update.zip", full) if complete_tools else full
+        if system == "darwin":
+            full = asset = uploaded.get(f"Peach-{tag.removeprefix('v')}-macos-{machine}.dmg")
+            if full is None:
+                continue
+        else:
+            prefix = f"Peach-{tag.removeprefix('v')}-windows-x64"
+            full = uploaded.get(prefix + ".zip")
+            if full is None:
+                continue
+            complete_tools = all(prefix + f"-tools-{tool}.zip" in uploaded for tool in TOOL_PATHS)
+            asset = uploaded.get(prefix + "-update.zip", full) if complete_tools else full
         directory = f"{RELEASES_URL}/download/{tag}"
-        releases.append((version, tag, asset, full, directory, f"{RELEASES_URL}/tag/{tag}"))
+        release_url = f"{RELEASES_URL}/tag/{tag}"
+        releases.append((version, tag, asset, full, directory, release_url))
     return releases
 
 
-def _failure(response) -> str:
-    """把非 200 的响应说清楚，别让限流和网络故障共用一个「请重试」。"""
-    if response.status == 403 and response.headers.get("x-ratelimit-remaining") == "0":
-        # 匿名配额按出口 IP 计，代理后面常常是很多人共用一个。
-        return "GitHub 接口的匿名配额已用完，请稍后重试或配置代理。"
-    if response.status == 404:
-        return f"找不到 {REPOSITORY} 的发布页。"
-    return f"未能取得版本信息（HTTP {response.status}），请重试。"
-def check(*, transport=None) -> dict:
-    result = snapshot()
-    client = transport or HttpxTransport()
+def _listing(client) -> list | None:
+    """发行列表；取不到时给 None，让调用方区分「没查成」和「查成了但没有可下载的版本」。"""
     try:
         headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
         response = client(HttpRequest("GET", API_URL, headers), 12.0, 2_000_000)
-        rows = json.loads(response.body) if response.status == 200 else None
-        releases = _release_candidates(rows) if isinstance(rows, list) else []
+        if response.status != 200:
+            return None
+        rows = json.loads(response.body)
+    except (OSError, ValueError, TypeError, TimeoutError, httpx.HTTPError):
+        return None
+    return rows if isinstance(rows, list) else None
+
+
+def tool_package(tool: str, *, transport=None) -> dict:
+    """最新公开版本里的 Windows 工具包 `Peach-<版本>-windows-x64-tools-<tool>.zip`。
+
+    源码运行的版本号不一定有同名发布（主线可能已在下一版），所以不按本机版本拼地址，
+    取列表里最新的那份；工具包与程序版本无关，包内 `manifest.json` 自带工具版本。
+    返回 `url`、`size`、`digest`（`sha256:` 前缀）与 `version`；取不到时抛 ValueError。
+    """
+    client = transport or HttpxTransport()
+    try:
+        rows = _listing(client) or []
+        found = []
+        for row in rows:
+            version = _version(row.get("tag_name")) if isinstance(row, dict) and not row.get("draft") else None
+            if version is None:
+                continue
+            tag = row["tag_name"]
+            name = f"Peach-{tag.removeprefix('v')}-windows-x64-tools-{tool}.zip"
+            asset = next((a for a in row.get("assets") or [] if isinstance(a, dict)
+                          and a.get("name") == name and a.get("state") == "uploaded"), None)
+            if (asset is None or not re.fullmatch(r"sha256:[0-9a-f]{64}", asset.get("digest") or "")
+                    or not isinstance(asset.get("size"), int)):
+                continue
+            found.append((version, {"url": f"{RELEASES_URL}/download/{tag}/{name}", "size": asset["size"],
+                                    "digest": asset["digest"], "version": tag.removeprefix("v")}))
+        if not found:
+            raise ValueError("未能从发布页取得工具包信息，请检查网络与 Peach 代理后重试")
+        return max(found, key=lambda item: item[0])[1]
+    finally:
+        if transport is None:
+            client.close()
+
+
+def check(*, transport=None, system: str | None = None, machine: str | None = None) -> dict:
+    result = snapshot()
+    system = system or sys.platform
+    machine = machine or platform.machine()
+    client = transport or HttpxTransport()
+    try:
+        rows = _listing(client)
+        if rows is None:
+            return dict(result, state="error", message="未能取得版本信息，请重试。")
+        releases = _release_candidates(rows, system, machine)
         if not releases:
-            if isinstance(rows, list):
-                return dict(result, state="empty", message="暂未找到可下载的测试版。")
-            return dict(result, state="error", message=_failure(response))
+            return dict(result, state="empty", message="暂未找到可下载的测试版。")
         version, tag, asset, full, directory, release_url = max(releases, key=lambda item: item[0])
         current = _version(result["current_version"])
         if current is None:
             raise ValueError("current version required")
         state = "available" if version > current else "ahead" if version < current else "current"
         message = {"available": "有新版本可下载。", "ahead": "当前版本高于已发布测试版。", "current": "已是最新测试版。"}[state]
+        if distribution.docker():
+            # 版本号跟着 Windows 包判；镜像在 Release 之后才推送，空窗里拉到的还是旧镜像，
+            # 所以以 Docker Hub 上版本号标签与 edge 指向同一镜像为准（ADR-0140）。
+            latest = tag.removeprefix("v")
+            if state == "available" and not docker_update.published(client, latest):
+                state, message = "pending", f"Peach {latest} 的镜像尚未发布，请稍后再检查。"
+            extra = {"one_click": docker_update.status()} if state == "available" else {}
+            return dict(result, latest_version=latest, state=state, release_url=release_url, **extra,
+                        message="有新镜像可拉取。" if state == "available" else message)
         return dict(result, latest_version=tag.removeprefix("v"), state=state, message=message,
                     asset_url=f"{directory}/{asset['name']}",
                     asset_size=asset.get("size", 0), asset_digest=asset.get("digest"),
-                    package_kind="update" if asset is not full else "full",
+                    package_kind="installer" if system == "darwin" else "update" if asset is not full else "full",
                     # 应用更新包准备不下去（清单或工具包与本版更新器对不上）时改下的同版本完整包。
                     full_url=f"{directory}/{full['name']}", full_size=full.get("size", 0),
                     full_digest=full.get("digest"),

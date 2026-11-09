@@ -22,6 +22,7 @@ from pathlib import Path
 from .smb_media import input_url
 
 from .mp4index import _iter_boxes
+from .task_control import run as run_task_process
 
 LOGGER = logging.getLogger(__name__)
 
@@ -29,7 +30,8 @@ LOGGER = logging.getLogger(__name__)
 CONTAINERS = frozenset({b"moov", b"trak", b"mdia", b"minf", b"stbl", b"edts"})
 #: 头部盒子加起来的上限；超过这个数就不是我们认识的片源，宁可不修。
 HEADER_LIMIT = 64 << 20
-PROBE_TIMEOUT_SECONDS = 900
+#: 连续没有任何解码输出的等待时间；整片解码不按片长限制总耗时。
+PROBE_IDLE_SECONDS = 900
 SIDECAR_MAGIC = b"PEACHMP4\x02"
 LEGACY_SIDECAR_MAGIC = b"PEACHMP4\x01"
 SIDECAR_SUFFIX = ".mp4hdr"
@@ -136,7 +138,7 @@ def _decode_times(stts: bytes) -> list[int]:
     return times
 
 
-def _display_order(ffprobe: Path, source: Path, decode_times: list[int]) -> list[int]:
+def _display_order(ffprobe: Path, source: Path, decode_times: list[int], *, progress=None) -> list[int]:
     """每个样本（解码序）的显示名次。
 
     解码器吐出来的帧就是显示顺序，每帧的 `pts` 原样来自它那个样本；这里 pts 就等于 dts，
@@ -146,18 +148,31 @@ def _display_order(ffprobe: Path, source: Path, decode_times: list[int]) -> list
 
     对不上就抛 `RepairUnavailable`：宁可不修，也不能写一张错的表。
 
-    `-threads 0` 不是调参，是补上 ffprobe 默认没开的解码线程：6297 上实测 300 秒内容
-    从 27 秒降到 4 秒，整片从十几分钟降到一两分钟。
+    解码线程沿用任务档位，高强度和独立调用交给 FFmpeg 自动分配。
     """
+    from .task_resources import media_input
+    from .processing_control import ffmpeg_options
+    media_input(source)
     command = (
-        str(ffprobe), "-v", "error", "-threads", "0",
+        str(ffprobe), "-v", "error", *(ffmpeg_options() or ['-threads', '0']),
         "-ignore_editlist", "1", "-select_streams", "v:0",
         "-show_entries", "frame=pts", "-of", "csv=p=0", input_url(source),
     )
+    frames = 0
+
+    def report(chunk):
+        nonlocal frames
+        frames += chunk.count(b'\n')
+        if progress is not None:
+            progress(min(frames, len(decode_times)), len(decode_times))
+
     try:
-        completed = subprocess.run(command, capture_output=True, timeout=PROBE_TIMEOUT_SECONDS,
+        completed = run_task_process(command, capture_output=True, idle_timeout=PROBE_IDLE_SECONDS,
+                                   on_stdout=report,
                                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except subprocess.TimeoutExpired as exc:
+        raise RepairUnavailable(f"ffprobe 连续 {PROBE_IDLE_SECONDS} 秒没有解码输出") from exc
+    except OSError as exc:
         raise RepairUnavailable(f"ffprobe 没跑完：{exc}") from exc
     if completed.returncode:
         raise RepairUnavailable(f"ffprobe 退出码 {completed.returncode}")
@@ -353,7 +368,7 @@ def _layout(source: Path) -> _Layout:
                        after[start:stop], moov[2] - moov[1], None)
 
 
-def repaired_header(source: Path, ffprobe: Path) -> RepairedHeader:
+def repaired_header(source: Path, ffprobe: Path, *, progress=None) -> RepairedHeader:
     """算出修好的头。修不了就抛 `RepairUnavailable`。"""
     layout = _layout(source)
     mdat = layout.mdat
@@ -372,7 +387,7 @@ def repaired_header(source: Path, ffprobe: Path) -> RepairedHeader:
 
     decode_times = _decode_times(stts.payload)
     offsets, shift = _composition_offsets(
-        decode_times, _display_order(ffprobe, source, decode_times))
+        decode_times, _display_order(ffprobe, source, decode_times, progress=progress))
     if not shift and all(value == 0 for value in offsets):
         raise RepairUnavailable("显示顺序本来就等于解码顺序，没有要修的")
 
@@ -532,28 +547,31 @@ class HeaderRepairStore:
     所以只在后台算、一次只算一部，算不出来就记下来别再试——调用方照旧走转码分片。
     """
 
-    def __init__(self, root: Path, resolver, *, max_concurrent: int = 1, cached: int = 4):
+    def __init__(self, root: Path, resolver, *, max_concurrent: int = 1, cached: int = 4, runs=None):
         self.root = Path(root)
         self.resolver = resolver
         self._slots = threading.Semaphore(max(1, max_concurrent))
         self._running: set[str] = set()
-        self._failed: set[str] = set()
+        self._failed: dict[str, str] = {}
         # 一份头有几 MB（整个 moov 加 ctts），而播放时每个 Range 请求都要问一次。
         # 同时在播的片子就那么一两部，留最近几份在手边，别反复读同一个文件。
         self._cached: dict[str, RepairedHeader] = {}
         self._cache_size = max(1, cached)
         self._guard = threading.Lock()
+        self.runs = runs
+        self._jobs = {}
 
-    def _name(self, asset_id: int, source: Path) -> str | None:
-        try:
-            stat = source.stat()
-        except OSError:
-            return None
+    def _name(self, asset_id: int, source: Path, stat=None) -> str | None:
+        if stat is None:
+            try:
+                stat = source.stat()
+            except OSError:
+                return None
         return f"{asset_id}-{stat.st_size}-{stat.st_mtime_ns}{SIDECAR_SUFFIX}"
 
-    def lookup(self, asset_id: int, source: Path) -> RepairedHeader | None:
-        """已经算好的头；没有就返回 None，不去算。"""
-        name = self._name(asset_id, source)
+    def lookup(self, asset_id: int, source: Path, *, stat=None) -> RepairedHeader | None:
+        """已经算好的头；没有就返回 None，不去算。`stat` 是调用方刚取过的片源 stat，给了就不再问网盘。"""
+        name = self._name(asset_id, source, stat)
         if not name:
             return None
         with self._guard:
@@ -584,12 +602,31 @@ class HeaderRepairStore:
         with self._guard:
             if name in self._running or name in self._failed:
                 return
-        threading.Thread(
-            target=self.repair_now, args=(asset_id, source),
-            name=f"PeachMp4Header-{asset_id}", daemon=True,
-        ).start()
+            previous = self._jobs.get(name)
+            if previous is not None:
+                state = previous.snapshot() or {}
+                if state.get('status') in ('running', 'cancelled'):
+                    return
+            from .jobs import BackgroundJob
+            job = BackgroundJob(f'PeachMp4Header-{asset_id}', task_key='mp4-header-repair',
+                                mutex_key=f'mp4-header-repair:{name}', runs=self.runs)
+            self._jobs[name] = job
 
-    def repair_now(self, asset_id: int, source: Path) -> bool:
+        def work(job_id):
+            made = self.repair_now(asset_id, source, progress=lambda current, total: job.update(
+                job_id, checked=current, total=total))
+            job.update(job_id, status='complete' if made else 'failed',
+                       repaired=int(made), error='' if made else self._failed.get(name, '播放文件头未能修复'))
+
+        job.start(work, initial={'stage': '读取帧时间戳', 'name': source.name, 'asset_id': asset_id})
+
+    def stop(self):
+        with self._guard:
+            jobs = list(self._jobs.values())
+        for job in jobs:
+            job.stop()
+
+    def repair_now(self, asset_id: int, source: Path, *, progress=None) -> bool:
         """当场算一份头并存下来。已经有、正在算或上次算不出来都返回 False。"""
         name = self._name(asset_id, source)
         ffprobe = self.resolver.ffprobe()
@@ -600,8 +637,16 @@ class HeaderRepairStore:
                 return False
             self._running.add(name)
         try:
-            with self._slots:
-                write_sidecar(self.root / name, repaired_header(source, ffprobe.path))
+            from .task_control import checkpoint
+            while not self._slots.acquire(timeout=.1):
+                checkpoint()
+            try:
+                checkpoint()
+                header = (repaired_header(source, ffprobe.path) if progress is None else
+                          repaired_header(source, ffprobe.path, progress=progress))
+                write_sidecar(self.root / name, header)
+            finally:
+                self._slots.release()
             for stale in self.root.glob(f"{asset_id}-*{SIDECAR_SUFFIX}"):
                 if stale.name != name:
                     stale.unlink(missing_ok=True)
@@ -609,7 +654,7 @@ class HeaderRepairStore:
         except (RepairUnavailable, OSError, struct.error) as exc:
             LOGGER.info("mp4 header repair unavailable for asset %s: %s", asset_id, exc)
             with self._guard:
-                self._failed.add(name)
+                self._failed[name] = str(exc)
             return False
         finally:
             with self._guard:

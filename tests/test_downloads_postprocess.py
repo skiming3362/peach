@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 from peach import download_postprocess as post
 from peach import ledger_backups
 from peach.downloads import DownloadStore, DownloadTask, INGESTED, POSTPROCESS_PENDING
+from peach.ingest_notices import IngestNotices
 from peach.jobs import JobDeferred
 from peach.repository import LedgerDatabase
 from support.ledger import fresh_ledger
@@ -46,6 +47,7 @@ class DownloadPostprocessTests(unittest.TestCase):
             postprocess_state=POSTPROCESS_PENDING))
         self.contract = SimpleNamespace(
             database=self.database, db_path=self.database.db_path,
+            downloads=SimpleNamespace(wake=Mock(), clock=time.time),
             candidate_root=self.root / 'generated',
             download_organize_templates=lambda: {'115': {'file': '{code}'}}, cache_bust=lambda: None)
         self.handle = SimpleNamespace(progress=lambda **_: None)
@@ -54,6 +56,7 @@ class DownloadPostprocessTests(unittest.TestCase):
         self.plan = patch.object(post.organize, 'build_plan', return_value=plan)
         self.plan.start()
         self.addCleanup(self.plan.stop)
+        self.collect_source = post._collect
         collect = patch.object(post, '_collect', return_value={'candidates': 0})
         collect.start()
         self.addCleanup(collect.stop)
@@ -63,6 +66,53 @@ class DownloadPostprocessTests(unittest.TestCase):
 
     def run_task(self):
         return post.run(self.contract, post.followup_key(self.task.id), self.handle)
+
+    def test_temporary_failure_is_scheduled_and_only_three_retries_are_allowed(self):
+        from peach.downloads import parse_iso
+        from peach.task_retry import RETRY_DELAYS
+        started = 1_800_000_000.0
+        self.contract.downloads.clock = lambda: started
+        with patch.object(post, '_collect', side_effect=TimeoutError('来源连接超时')):
+            for attempt, delay in enumerate(RETRY_DELAYS, 1):
+                with self.assertRaises(TimeoutError):
+                    self.run_task()
+                task = self.store.get(self.task.id)
+                self.assertEqual((task.postprocess_state, task.postprocess_retries), ('pending', attempt))
+                self.assertEqual(parse_iso(task.next_check_at), started + delay)
+                self.assertEqual(self.store.pending_postprocess(started), [])
+                self.assertEqual([row.id for row in self.store.pending_postprocess(parse_iso(task.next_check_at))], [task.id])
+                started += delay
+            with self.assertRaises(TimeoutError):
+                self.run_task()
+        task = self.store.get(self.task.id)
+        self.assertEqual(task.postprocess_state, 'failed')
+        self.assertIsNone(task.next_check_at)
+        self.assertIn('自动重试 3 次', task.postprocess_detail)
+
+    def test_offline_mount_retries_but_target_collision_stops_immediately(self):
+        with patch.object(post.organize, 'build_plan', return_value={
+                'rows': [{'action': 'skip', 'reason': post.organize.SKIP_OFFLINE}],
+                'reasons': {post.organize.SKIP_OFFLINE: 1}}), self.assertRaises(RuntimeError):
+            self.run_task()
+        self.assertEqual(self.store.get(self.task.id).postprocess_state, 'pending')
+        with patch.object(post.organize, 'build_plan', return_value={
+                'rows': [{'action': 'skip', 'reason': post.organize.SKIP_TARGET_EXISTS}],
+                'reasons': {post.organize.SKIP_TARGET_EXISTS: 1}}), self.assertRaises(RuntimeError):
+            self.run_task()
+        self.assertEqual(self.store.get(self.task.id).postprocess_state, 'failed')
+        self.assertIsNone(self.store.get(self.task.id).next_check_at)
+
+    def test_collection_retry_uses_structured_failure_instead_of_the_error_message(self):
+        log = self.root / 'issues.jsonl'
+        import json
+        state = {'issues_log': str(log), 'issue_count': 1}
+        issue = {'asset_id': self.asset_id, 'severity': 'error', 'retryable': True,
+                 'diagnostics': {'failures': [{'automatic_retry_delay': 900.0}]}}
+        log.write_text(json.dumps(issue) + '\n', encoding='utf-8')
+        self.assertEqual(post._collection_retry_delay(state, self.asset_id), 900)
+        issue['diagnostics'] = {'failures': [{'automatic_retry_delay': None}]}
+        log.write_text(json.dumps(issue) + '\n', encoding='utf-8')
+        self.assertIsNone(post._collection_retry_delay(state, self.asset_id))
 
     def test_existing_unrelated_foreign_key_violation_is_reported_without_failing_the_move(self):
         with self.database.write_transaction() as connection:
@@ -140,16 +190,20 @@ class DownloadPostprocessTests(unittest.TestCase):
         def organize(*args):
             events.append('organize')
             return original(*args)
+        notices = IngestNotices()
         with patch.object(post, '_isolate_ads', side_effect=lambda *_: events.append('check') or 0), \
                 patch.object(post, '_probe_folder', side_effect=lambda *_, **options: events.append('probe') or 1), \
                 patch.object(post, '_collect', side_effect=lambda *_: events.append('collect') or {'followups': rows}), \
                 patch.object(post, '_organize', side_effect=organize), \
-                patch.object(post, 'declared_rows', return_value=rows):
+                patch.object(post, 'declared_rows', return_value=rows), patch.object(post, 'NOTICES', notices):
             result = self.run_task()
+            self.assertEqual(self.run_task(), {'task_id': self.task.id, 'already_complete': True})
         self.assertEqual(events, ['check', 'probe', 'check', 'collect', 'check', 'organize', 'followup'])
         self.assertEqual(result['probed'], 1)
-        self.assertEqual(self.run_task(), {'task_id': self.task.id, 'already_complete': True})
         self.contract.task_runs.enqueue_followups.assert_called_once()
+        # 整理完成记一条入库通知，页面据此弹 toast；已完成的再跑一次不重复记。
+        [notice] = notices.snapshot()['items']
+        self.assertEqual((notice['kind'], notice['asset_id']), ('download', result['asset_id']))
 
     def test_collection_that_steps_aside_stays_queued_instead_of_failed(self):
         self.handle.run_id = 123
@@ -161,12 +215,39 @@ class DownloadPostprocessTests(unittest.TestCase):
         self.assertEqual((task.postprocess_state, task.postprocess_detail), ('queued', '等待扫描与采集完成后继续'))
         self.contract.task_runs.enqueue_followups.assert_not_called()
 
+    def test_collection_held_only_by_paused_sources_still_organizes_the_file(self):
+        """MIAB-086：其余资料已落库，只差一站拒绝访问；文件照常整理，详情写明哪项等来源恢复。"""
+        held = {'status': 'failed', 'error': '1 项都卡在来源限流上，等一会儿再跑一次。',
+                'issue_count': 1, 'paused_count': 1,
+                'issue_preview': [{'message': 'JavDB 标签未取得：来源拒绝访问'}]}
+        # 账本就在临时根下，配置的各目录都指回它。
+        config = SimpleNamespace(configured=True, directory=lambda name: self.root)
+        self.contract.cover_root = self.root / 'covers'
+        with patch.object(post.settings_file, 'active', return_value=config), \
+                patch.object(post, 'process_library', return_value=held):
+            state = self.collect_source(self.contract, self.asset_id, self.handle)
+        self.assertEqual(state['paused_pending'], ['JavDB 标签未取得：来源拒绝访问'])
+        with patch.object(post, '_collect', return_value=state):
+            result = self.run_task()
+        self.assertEqual(result['moved'], 1)
+        task = self.store.get(self.task.id)
+        self.assertEqual(task.postprocess_state, 'complete')
+        self.assertIn('JavDB 标签未取得：来源拒绝访问', task.postprocess_detail)
+        # 混有来源限流以外的问题时照旧失败，等人处理。
+        with patch.object(post.settings_file, 'active', return_value=config), \
+                patch.object(post, 'process_library', return_value={**held, 'issue_count': 2}):
+            with self.assertRaisesRegex(RuntimeError, '来源限流'):
+                self.collect_source(self.contract, self.asset_id, self.handle)
+
     def test_metadata_or_organization_failure_never_dispatches_followups(self):
         self.handle.run_id = 123
         self.contract.task_runs = Mock()
+        notices = IngestNotices()
         for failed_stage in ('_collect', '_organize'):
-            with self.subTest(stage=failed_stage), patch.object(post, failed_stage, side_effect=RuntimeError('模拟阶段失败')):
+            with self.subTest(stage=failed_stage), patch.object(post, failed_stage, side_effect=RuntimeError('模拟阶段失败')), \
+                    patch.object(post, 'NOTICES', notices):
                 with self.assertRaisesRegex(RuntimeError, '模拟阶段失败'):
                     self.run_task()
                 self.assertEqual(self.store.get(self.task.id).postprocess_state, 'failed')
                 self.contract.task_runs.enqueue_followups.assert_not_called()
+        self.assertEqual(notices.snapshot()['items'], [])

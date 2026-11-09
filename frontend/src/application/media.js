@@ -19,6 +19,8 @@ import { currentBarsContext, entityState, openEntity, revealForIsland, syncForIs
 import { openAddToPlaylist, rereadPlaylists, saveMixAsPlaylist } from './playlists.js';
 import { releaseHoverPreviews } from './../card-art/hover';
 import { applicationEffects } from './effects';
+import { loadingState } from './loading.js';
+import { t } from '../i18n';
 export const mediaState = { total: undefined, facets: undefined, stageHost: undefined, stageOpen: undefined, itemDetailHelpers: undefined, itemDetailActions: undefined, immerseHost: undefined, immerseOpen: undefined, requestedImmerseId: undefined };
 
 export function urlResume(){
@@ -70,6 +72,7 @@ export function openPlaylist(playlistId,itemId=null,push=true){return openQueue(
 
 export function hasReturnSurface(){
   return !!$('#grid').querySelector('[data-id],[data-mix-seed]')
+    ||!!document.querySelector('[data-video-wall]')
     ||!$('#index').hidden||!$('#stats').hidden;
 }
 
@@ -131,8 +134,8 @@ export async function closeItemDetail(){
   if(restoreSurface&&navigationState.managedPagePath(new URL(returnPath,location.href).pathname)){navigationState.navigatePath(returnPath);return}
   navigationState.route(returnPath);
   if(restoreSurface)writeShell({pageOpens:pageOpens+1});
-  // 播放列表页回来就从头重开、取最新的那一份（详情里可能刚加进或移出了一条）。
-  else{buildBars();if(location.pathname==='/playlists')writeShell({pageOpens:pageOpens+1})}
+  // 播放列表保留页面，只刷新续播位置和详情里修改的列表内容。
+  else{buildBars();if(location.pathname==='/playlists')rereadPlaylists()}
 }
 
 /** 库外作品在同一个详情舞台打开，来处与关闭行为跟随覆盖条目。 */
@@ -157,8 +160,9 @@ export async function openJavMovie(code,push=true){
         if(peachHistory.navigation.seq!==seq||!canonical||canonical===code)return;
         shellNavigate('/works/'+encodeURIComponent(canonical)+location.search+location.hash,
           {replace:true,state:peachHistory.navigation.location.state});
+        loadingState.syncPageTitle(location.href);
       },
-      openTag:tag=>{commitContextFilter(filters=>{filters.tag=tag});window.scrollTo({top:0,behavior:'smooth'})},
+      openTag:tag=>commitContextFilter(filters=>{filters.tag=tag}),
       receipt:message=>receiptsState.toast({text:message})}});
   scheduleStickySurfaces();
 }
@@ -197,7 +201,7 @@ mediaState.itemDetailHelpers = {
   tagCandidates:()=>(mediaState.facets&&mediaState.facets.tags)||[],
   sourceOffline:key=>preferencesState.sourceOffline(key),
   offlineReason:key=>preferencesState.offlineReason(key),
-  relatedSkeletonHtml:()=>pageSkeletonHtml('正在读取推荐',{cards:true,className:'related-skeleton'}),
+  relatedSkeletonHtml:()=>pageSkeletonHtml(t('shell:skeleton.loadingRecommendations'),{cards:true,className:'related-skeleton'}),
   mixRelated:seedId=>mixRelated(seedId),
   wireDrag:el=>wireDrag(el),
   wireDragReorder:(root,options)=>wireDragReorder(root,options),
@@ -211,6 +215,7 @@ mediaState.itemDetailActions = {
     writeShell({barsContext:{type:'item',id:item.id,filters:returnBars?.type==='entity'
       ? {...returnBars.filters}:entityState.emptyEntityFilters()}});
     if(pendingQueueRoute){navigationState.queueOpenRequest=null;navigationState.route(`/assets/${item.id}?${pendingQueueRoute}`,false,overlayState('item'));writeShell({pendingQueueRoute:null})}
+    loadingState.syncPageTitle(location.href);
     buildBars();
   },
   /* 取数时发现要换去别处：保存过的在线作品转关注详情，队列取不到退回普通详情，播放列表空了
@@ -243,9 +248,9 @@ mediaState.itemDetailActions = {
     followState.followAuthors=new Set();followState.followProviders=new Set();followState.followTags=new Set();followState.followWorks=new Set();followState.followMediaView='videos';
     followState.followDurMin=followState.followDurMax=0;followState.followFilter='saved';openRoutedPage(followViewPath())},
   openEntity:(kind,name)=>openEntity(kind,name),
-  openUnowned:()=>goHome({owner:'none'},true),
-  openRegion:region=>goHome({region:region||'none'},true),
-  openTag:tag=>{commitContextFilter(filters=>{filters.tag=tag});window.scrollTo({top:0,behavior:'smooth'})},
+  openUnowned:()=>goHome({owner:'none'}),
+  openRegion:region=>goHome({region:region||'none'}),
+  openTag:tag=>commitContextFilter(filters=>{filters.tag=tag}),
   addToPlaylist:item=>openAddToPlaylist(item),
   saveMix:options=>saveMixAsPlaylist(options),
   editPlaylist:()=>openRoutedPage('/playlists'),
@@ -273,7 +278,7 @@ mediaState.immerseHost = {
   closed:()=>goHome(),
   openItem:id=>void openItem(id),
   openEntity:(kind,name)=>openEntity(kind,name),
-  openUnowned:()=>goHome({owner:'none'},true),
+  openUnowned:()=>goHome({owner:'none'}),
   toast:(message,{undo}={})=>receiptsState.actionReceipt(message,{undo}),
   warn:message=>receiptsState.toast({text:message},{sound:'warning'}),
   failure:(action,error)=>receiptsState.actionFailure(action,error),

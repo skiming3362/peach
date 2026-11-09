@@ -27,6 +27,7 @@ from peach.follow_secrets import CredentialError
 from peach.follow_sources import FollowCandidate, SourceFetch
 from peach.follow_store import FollowStore
 from peach.http import HttpResponse
+from peach.repository import in_background
 from support.backoff import no_real_backoff
 from support.ledger import fresh_ledger
 from peach.web_contract import WebContract, dispatch_api_get, dispatch_api_post
@@ -174,6 +175,35 @@ class FollowContractTests(unittest.TestCase):
         self.assertEqual([row['source'] for row in result['results']], [selected])
         self.assertEqual(factory.call_count, 1)
 
+    def test_sources_skipped_for_a_site_cooldown_are_not_reported_as_failures(self):
+        """站点限流冷却中：同站的来源这一轮不问，也不进失败清单（ADR-0134）。"""
+        from peach.follow_stream import FollowMediaResolver
+        self._seed(ref='first')
+        self._seed(ref='second')
+        self.contract.follow_media_resolver = FollowMediaResolver(transport=None)
+        self.contract.follow_media_resolver.pause('rule34video', 60)
+        with mock.patch.object(web_follow, 'build_connector') as factory:
+            result = self._post('/api/follow/check', {})
+            # 往回一路抓到底也一样：冷却中的那条只跳过一次，不在原地空转翻页。
+            backfill = self._post('/api/follow/check', {'older': True, 'backfill_all': True})
+        self.assertEqual(factory.call_count, 0)
+        self.assertEqual((result['results'], result['deferred']), ([], 2))
+        self.assertEqual((backfill['results'], backfill['deferred']), ([], 2))
+
+    def test_a_scheduled_round_checks_only_the_sources_that_are_due(self):
+        """定时那一跳跳过刚查过、又久未更新的来源；手动检查照旧全查。"""
+        stale = self._seed(ref='stale')
+        recent = self._seed(ref='recent')
+        with self.contract.database.write_transaction() as connection:
+            connection.execute("UPDATE follow_source SET last_checked_at=? WHERE id=?",
+                               (datetime.now(timezone.utc).isoformat(), recent))
+        with mock.patch.object(web_follow, 'build_connector') as factory:
+            factory.return_value.fetch.side_effect = FollowSourceError('offline')
+            scheduled = self._post('/api/follow/check', {'automatic': True})
+            manual = self._post('/api/follow/check', {})
+        self.assertEqual([row['source'] for row in scheduled['results']], [stale])
+        self.assertEqual({row['source'] for row in manual['results']}, {stale, recent})
+
     def test_failed_numeric_source_has_a_readable_author(self):
         source = self._seed(ref='patreon/12387984', label='Pantsushi · patreon')
         with mock.patch.object(web_follow, 'build_connector') as factory:
@@ -260,6 +290,44 @@ class FollowContractTests(unittest.TestCase):
 
     def _post(self, path, body):
         return dispatch_api_post(self.contract, path, body)
+
+    def test_a_background_sync_reaches_the_list_after_the_request_has_closed(self):
+        """后台同步写进新条目后，关注页先回上一份、另起后台重算（ADR-0146）。
+
+        重算跑起来时请求那条连接早已关掉；重算还得从账本现读，不能拿请求那一刻的旧条目
+        去排列表、数筛选项，否则旧结果记在新版本下，计数变了、列表一直缺新条目。
+        """
+        source_id = self._seed()
+        self.assertEqual(self._get()["counts"]["new"], 2)
+
+        @in_background
+        def sync():
+            with self.contract.database.write_transaction() as connection:
+                FollowStore(lambda: connection, sources_root=self.contract.follow_sources_root).record(
+                    source_id, SourceFetch(
+                        provider="rule34video", ref="lazyprocrastinator",
+                        request_url="https://rule34video.test/lazyprocrastinator", semantics="work",
+                        candidates=(FollowCandidate(provider="rule34video", external_id="4600001",
+                                                    title="Brand New Upload",
+                                                    url="https://rule34video.com/video/4600001/x/",
+                                                    extra={"tags": ["fresh"],
+                                                           "tag_types": {"fresh": "general"}}),),
+                        raw_body=b"<html>later</html>"),
+                    moment=MOMENT)
+
+        writer = threading.Thread(target=sync)
+        writer.start()
+        writer.join(5)
+        with self.assertNoLogs("peach.web_state", level="ERROR"):
+            self._get()
+            deadline = time.monotonic() + 10
+            while self.contract.stale_refreshing and time.monotonic() < deadline:
+                time.sleep(0.01)
+        self.assertEqual(self.contract.stale_refreshing, set())
+        after = self._get()
+        self.assertEqual(after["counts"]["new"], 3)
+        self.assertIn("Brand New Upload", [group["primary"]["title"] for group in after["groups"]])
+        self.assertIn("fresh", dict(after["facets"]["tags"]))
 
     def test_saved_catalog_media_uses_the_follow_cover_and_content_tags(self):
         self._seed(candidates=(FollowCandidate(
@@ -1485,6 +1553,18 @@ class FollowContractTests(unittest.TestCase):
         self.assertEqual(row["k"], "LazyProcrastinator")
         self.assertEqual(sorted(row["providers"]), ["rule34video", "rule34xxx"])
 
+    def test_the_online_roster_carries_each_authors_latest_post_and_follows_new_items(self):
+        """搜索推荐写「最新更新于」读的就是这一格；名册按账本缓存，新条目进来就得重数。"""
+        self._seed(ref="a", label="Author A", candidates=(
+            self._clip("a1", published_at="2026-03-01T00:00:00Z"),
+            self._clip("a2", published_at="2026-05-02T08:00:00Z")))
+        row = self._get("/api/follow/authors")["items"][0]
+        self.assertEqual((row["n"], row["latest"]), (2, "2026-05-02T08:00:00Z"))
+        self._seed(ref="a", label="Author A", candidates=(
+            self._clip("a3", published_at="2026-06-03T00:00:00Z"),))
+        row = self._get("/api/follow/authors")["items"][0]
+        self.assertEqual((row["n"], row["latest"]), (3, "2026-06-03T00:00:00Z"))
+
     def test_the_online_roster_supports_search_and_paging(self):
         """形状与 /api/index 一致：艺人页的分页、过滤和「载入更多」换个地址就能用。"""
         self._seed(ref="a", label="Author A", candidates=(self._clip("a1"),))
@@ -1633,8 +1713,8 @@ class FollowContractTests(unittest.TestCase):
         self.assertEqual(self._get()["facets"]["works"][0][4]["pct"], 17)
 
     def test_sources_read_before_a_concurrent_write_are_not_kept_under_the_new_version(self):
-        """来源、别名先于缓存读出，再被带进缓存的计算。两次读之间来源被停用的话，旧来源
-        算出的条目不能记在新版本下一直命中：停用之后的下一次请求就不再列出它的条目。"""
+        """来源、别名在请求开头读出，缓存的计算另从账本现读一份。两次读之间来源被停用的话，
+        旧来源算出的条目不能记在新版本下一直命中：停用之后的下一次请求就不再列出它的条目。"""
         self._seed()
         real = FollowStore.sources
         writes = []
@@ -1647,7 +1727,7 @@ class FollowContractTests(unittest.TestCase):
             return rows
 
         with mock.patch.object(FollowStore, "sources", sources_then_disable):
-            self.assertTrue(self._get()["groups"])
+            self._get()
             self.assertEqual(writes, [1])
             self.assertEqual(self._get()["groups"], [])
 

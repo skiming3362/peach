@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import re
@@ -23,6 +24,7 @@ from urllib.parse import unquote
 
 from browserexport.common import BrowserexportError
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 
 from . import push_discovery, web_contract, web_tasks
@@ -35,6 +37,7 @@ from .platform import is_unmapped, translate_ledger_path
 from .providers import ProviderUnavailable
 from .routes_auth import require_auth
 from .task_runs import task_label
+from .task_control import Cancelled as TaskCancelled
 from .taste_history import analyze_history, import_history_exports, write_manifest
 
 router = APIRouter()
@@ -248,6 +251,36 @@ def task_run_detail(request: Request, run_id: int,
         return JSONResponse({"error": str(exc.args[0])}, status_code=404)
 
 
+@router.post('/api/tasks/{run_id}/control')
+def task_run_control(request: Request, run_id: int, body: dict = Body(default_factory=dict),
+                     _args: dict[str, str] = Depends(require_auth)):
+    from . import task_control
+    contract = request.app.state.web_contract
+    try:
+        run = contract.task_runs.get(run_id)
+        if (run is not None and run.active and run.task_key == 'library-processing'
+                and body.get('action') != 'set_speed'):
+            from .web_library_processing import _active_run, _current, w_library_processing
+            current = _current(contract)
+            active = _active_run(contract, current)
+            if active is None or active.id != run_id:
+                raise ValueError('任务已变化，请刷新后重试')
+            if not contract.task_runs.enabled or run.host != contract.task_runs.host:
+                raise PermissionError('请在执行这轮任务的写入端操作')
+            w_library_processing(contract, {'action': body.get('action'), 'job_id': current.get('job_id'),
+                                             'speed_mode': body.get('speed_mode')})
+        else:
+            task_control.request(contract.task_runs, run_id, body.get('action'), mode=body.get('speed_mode'))
+        contract.followups.wake()
+        return web_tasks.q_task(contract, run_id)
+    except KeyError as exc:
+        return JSONResponse({'error': str(exc.args[0])}, status_code=404)
+    except PermissionError as exc:
+        return JSONResponse({'error': str(exc)}, status_code=403)
+    except ValueError as exc:
+        return JSONResponse({'error': str(exc)}, status_code=409)
+
+
 @router.post(push_discovery.WEBHOOK_PATH, status_code=204)
 def clouddrive_inbox(request: Request, body: dict[str, Any] = Body(default_factory=dict)):
     """CloudDrive2 的文件变更通知。
@@ -316,6 +349,24 @@ def _conflict(error: TaskRunConflict) -> JSONResponse:
 LOCAL_ONLY_ROUTES = frozenset({"/api/media-processing", "/api/thumbnail-jobs"})
 
 
+def _json(payload) -> Response:
+    """契约读接口的 JSON 响应，字节与 FastAPI 默认的那一份相同。
+
+    FastAPI 默认先用 `jsonable_encoder` 把整份结果逐个值走一遍再交给 `json.dumps`；
+    复核队列一份二十多 MB，光这一遍就要近五秒。契约结果本来就是 JSON 原生类型，只把
+    认不出的值（路径、时间等）交给它。
+    """
+    if isinstance(payload, Response):
+        return payload
+    try:
+        content = json.dumps(payload, ensure_ascii=False, allow_nan=False,
+                             separators=(",", ":"), default=jsonable_encoder).encode("utf-8")
+    except TypeError:
+        # JSON 原生键之外的日期、路径等，沿用框架转换键和值的规则。
+        return JSONResponse(jsonable_encoder(payload))
+    return Response(content, media_type="application/json")
+
+
 @router.get("/api/{route:path}")
 def api_get(request: Request, route: str, args: dict[str, str] = Depends(require_auth)):
     if f"/api/{route}" in LOCAL_ONLY_ROUTES:
@@ -327,9 +378,10 @@ def api_get(request: Request, route: str, args: dict[str, str] = Depends(require
             state.web_contract, f"/api/{route}", args)
         if route == "review" and sync is not None and sync.read_only:
             payload = state.review_mirror.resolve(payload)
-        return payload
     except TaskRunConflict as exc:
         return _conflict(exc)
+    except TaskCancelled:
+        return JSONResponse({'error': '任务已取消，已保存的结果保留'}, status_code=409)
     except UpdateBusy as exc:
         return JSONResponse({'error': 'update in progress', 'message': str(exc)}, status_code=409)
     except FolderRuleConflict as exc:
@@ -341,6 +393,8 @@ def api_get(request: Request, route: str, args: dict[str, str] = Depends(require
     except Exception:
         LOGGER.exception("unhandled GET contract error for /api/%s", route)
         return JSONResponse({"error": "internal server error"}, status_code=500)
+    # 序列化留在 try 外：结果编码失败与以前一样是一个 500，不被上面翻成 400。
+    return _json(payload)
 
 
 @router.post("/api/{route:path}")
@@ -370,6 +424,8 @@ def api_post(
     try:
         return web_contract.dispatch_api_post(
             request.app.state.web_contract, route_path, body)
+    except TaskCancelled:
+        return JSONResponse({'error': '任务已取消，已保存的结果保留'}, status_code=409)
     except TaskRunConflict as exc:
         return _conflict(exc)
     except UpdateBusy as exc:

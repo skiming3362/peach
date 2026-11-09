@@ -176,7 +176,9 @@ class DockerPublicationTests(unittest.TestCase):
                        "candidate": {"identity": {"pipeline": "7"}, "docker": {"image_id": image["Id"]}}}
             (root / "build/ci-artifacts/release-candidate.json").write_text(json.dumps(receipt))
             driver = root / "driver.ps1"
-            driver.write_text('''function docker {
+            # 重定向时 pwsh 按系统代码页输出，中文 Windows 上失败消息是 GBK；按 UTF-8 读要先切换。
+            driver.write_text('''[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+function docker {
     param([Parameter(Position=0, ValueFromRemainingArguments=$true)][string[]]$DockerArgs,
           [Parameter(ValueFromPipeline=$true)][string]$LoginInput)
     Add-Content -LiteralPath calls.log -Value ($DockerArgs -join ' ')
@@ -194,8 +196,10 @@ try { & $env:TEST_CI_ENTRY docker-push } catch { Write-Output $_; exit 3 }
                 with self.subTest(failed=fail):
                     log = root / "calls.log"
                     log.unlink(missing_ok=True)
+                    # 中文 Windows 上 pwsh 的错误流按控制台代码页输出；输出只用于失败说明，解不了的字节替换掉。
                     result = subprocess.run([shutil.which("pwsh"), "-NoProfile", "-NonInteractive", "-File", str(driver)],
-                        cwd=root, env={**environment, "TEST_FAIL_PUSH": str(int(fail))}, text=True, encoding="utf-8", capture_output=True)
+                        cwd=root, env={**environment, "TEST_FAIL_PUSH": str(int(fail))}, text=True, encoding="utf-8",
+                        errors="replace", capture_output=True)
                     calls = log.read_text(encoding="utf-8-sig")
                     self.assertEqual(result.returncode == 0, not fail, (result.stdout or "") + (result.stderr or ""))
                     self.assertEqual("image rm peach-ci:1.2.3-7" in calls, not fail)

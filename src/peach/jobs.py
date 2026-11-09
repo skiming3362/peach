@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .media_sources import SOURCE_COSTS, cost_for, cost_sql
+from .repository import in_background
 
 DEFAULT_METERED_LOCATIONS = frozenset(location for location, cost in SOURCE_COSTS.items()
                                     if cost == 'metered') | {'online'}
@@ -156,12 +157,13 @@ class DiskGuard:
 
     def check(self, force: bool = False) -> float | None:
         """到期就复查；返回本次读到的可用 GiB，未到期返回 None。触线抛 DiskSpaceDenied。"""
-        from .update_tasks import check_pause
-        check_pause(self._pause_db)
         now = time.monotonic()
         if not force and now < self._next_check:
             return None
         self._next_check = now + self.interval_secs
+        # 安装暂停与磁盘余量同一节流：逐帧、逐块都调 `check`，每次都问安装预约没有读者。
+        from .update_tasks import check_pause
+        check_pause(self._pause_db)
         try:
             free_gb = self.free_gb()
         except OSError as exc:
@@ -197,6 +199,33 @@ def process_alive(pid: int) -> bool:
         # 超界的 PID 一定不是本机活进程，按「已死」清理，而不是让整轮任务崩掉。
         return False
     return True
+
+
+def process_creation_time(pid: int) -> float | None:
+    """返回 PID 当前指向进程的 Unix 创建时间；权限不足时保守返回未知。"""
+    import psutil
+    try:
+        return psutil.Process(pid).create_time()
+    except psutil.NoSuchProcess:
+        return None
+    except (psutil.AccessDenied, psutil.ZombieProcess):
+        return None
+
+
+def process_matches(pid: int, started_at: str | None, *, alive=process_alive) -> bool:
+    """核对活 PID 是否就是任务启动时的进程，避免 PID 复用永久占锁。"""
+    if not alive(pid):
+        return False
+    if not started_at:
+        return True
+    from datetime import datetime
+    try:
+        task_started = datetime.fromisoformat(started_at.replace('Z', '+00:00')).timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return True
+    created = process_creation_time(pid)
+    # 无权读取创建时间时不误回收真实任务；允许时间戳及 Win32 精度的小幅偏差。
+    return created is None or created <= task_started + 2.0
 
 
 def _process_alive_windows(pid: int) -> bool:
@@ -328,6 +357,7 @@ class BackgroundJob:
         self._run_ids: dict[str, int] = {}
         self._activity_files: dict[str, Path] = {}
         self._recoverable: set[str] = set()
+        self._cancelled_stops: set[str] = set()
         self._paused_stops: set[str] = set()
         #: 摘 run id 与把那一行写成结束是同一件事：只摘不写完就放手的话，另一个线程
         #: 看见 id 没了以为已经收过尾，紧接着开的下一轮会撞上那一行还没释放的互斥键。
@@ -347,6 +377,13 @@ class BackgroundJob:
     def _database_path(self) -> Path | None:
         value = getattr(getattr(self.runs, 'database', None), 'db_path', None)
         return Path(value) if isinstance(value, (str, Path)) else None
+
+    def registration(self, job_id: str) -> tuple[tuple[Path, ...], tuple[int, ...]]:
+        """这一轮自己的任务登记文件与 `task_run` 行。要等别的任务都停下的那一轮查忙时，把自己除外。"""
+        activity = self._activity_files.get(job_id)
+        run_id = self._run_ids.get(job_id)
+        return ((activity,) if activity is not None else (),
+                (run_id,) if run_id is not None else ())
 
     def update(self, job_id: str, **fields: object) -> bool:
         """状态仍属于 `job_id` 时改字段；已经被顶掉就什么都不做并返回 False。"""
@@ -375,6 +412,8 @@ class BackgroundJob:
         退出时把进度同步进 `task_run`，写库在锁外：那一步要拿数据库的写锁，套在本类
         的锁里面就多了一组取锁顺序，而进度本来不需要和状态原子。节流由 store 做。
         """
+        from .task_control import checkpoint
+        checkpoint()
         if job_id in self._recoverable:
             from .update_tasks import check_pause
             check_pause(self._database_path())
@@ -491,7 +530,7 @@ class BackgroundJob:
                          "started_at": time.time(), "error": "", **(initial or {})}
                 state.update(self._resuming_fields(job_id, initial))
                 self.state = state
-                thread = threading.Thread(target=self._run, args=(fn, job_id),
+                thread = threading.Thread(target=in_background(self._run), args=(fn, job_id),
                                           daemon=True, name=self.name)
                 self.thread = thread
             snapshot = copy.deepcopy(state)
@@ -551,14 +590,27 @@ class BackgroundJob:
         if self.runs is None:
             return
         total = state.get("total")
+        # 只处理一部作品的任务在初始状态里带 `asset_id` 与 `name`，开跑就写进任务行，任务卡据此链接到它。
+        asset_id, name = state.get("asset_id"), state.get("name")
+        subject = ({"asset_id": asset_id, "name": name}
+                   if type(asset_id) is int and asset_id > 0 and isinstance(name, str) and name else None)
         run = self.runs.start(
             self.task_key, trigger=trigger, mutex_key=self.mutex_key,
             conflict="raise" if trigger == "manual" else "skip",
             total=int(total) if isinstance(total, (int, float)) else None,
-            label=self._progress_label(state))
+            label=self._progress_label(state), summary=subject)
         if run is None:
             return
         self._run_ids[job_id] = run.id
+        if state.get('speed_mode') is not None:
+            from .job_recovery import current_run
+            from .task_control import request, speed_mode
+            stored_mode = speed_mode(self.runs.database.db_path, run.id,
+                                     (run.parent_run_id, run.root_run_id), default=None)
+            if current_run.get() != run.id or stored_mode is None:
+                request(self.runs, run.id, 'set_speed', mode=state['speed_mode'])
+                stored_mode = state['speed_mode']
+            self.update(job_id, speed_mode=stored_mode)
         self.update(job_id, run_id=run.id)
 
     def _close_run(self, job_id: str, status: str, *, error: str = "",
@@ -583,6 +635,19 @@ class BackgroundJob:
         """
         from .update_tasks import _mutex, state_for
         db = self._database_path()
+        current = self.snapshot() or {}
+        run_id = self._run_ids.get(current.get(self.id_key))
+        if db is not None and run_id is not None:
+            from . import task_control
+            if not resume:
+                with _mutex(state_for(db)):
+                    task_control.request(self.runs, run_id, 'cancel')
+                    self._cancelled_stops.add(current[self.id_key])
+                thread = self.thread
+                if thread is not None and thread is not threading.current_thread():
+                    thread.join(timeout)
+                return
+            task_control.shutdown(db, run_id)
         with _mutex(state_for(db)) if db is not None else nullcontext():
             if not resume and db is not None:
                 from .job_recovery import cancel
@@ -633,10 +698,19 @@ class BackgroundJob:
         parent_run = current_run.set(None)
         parent_job = current_job_id.set(None)
         context = current_db.set(self._database_path() if job_id in self._recoverable else None)
+        from .task_control import Cancelled as TaskCancelled
         try:
             from .update_tasks import check_pause
-            check_pause(current_db.get())
-            fn(job_id)
+            from .task_control import bind, checkpoint
+            with bind(self.runs, self._run_ids.get(job_id), recoverable=job_id in self._recoverable) if self.runs is not None else nullcontext():
+                check_pause(current_db.get())
+                fn(job_id)
+                checkpoint()
+        except TaskCancelled:
+            with self.lock:
+                if self.state is not None and self.state.get(self.id_key) == job_id:
+                    self.state.update(status='cancelled', outcome='cancelled', error='',
+                                      followups=[], completed_at=time.time())
         except JobPaused:
             with self.lock:
                 if self.state is not None and self.state.get(self.id_key) == job_id:
@@ -680,11 +754,16 @@ class BackgroundJob:
                     checkpoint(db, self.task_key, job_id, state)
                     finish(db, self.task_key, job_id,
                            state['status'] if state.get('status') in ('failed', 'cancelled') else 'complete')
+                if db is not None and job_id in self._cancelled_stops:
+                    from .job_recovery import cancel, read
+                    if read(db, self.task_key).get('job_id') == job_id:
+                        cancel(db, self.task_key)
             finally:
                 activity = self._activity_files.pop(job_id, None)
                 if activity is not None:
                     activity.unlink(missing_ok=True)
                 self._recoverable.discard(job_id)
+                self._cancelled_stops.discard(job_id)
                 self._paused_stops.discard(job_id)
 
     def _settle(self, job_id: str) -> None:
