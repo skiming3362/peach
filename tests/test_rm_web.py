@@ -4,7 +4,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -749,9 +749,64 @@ class WebDataTests(unittest.TestCase):
             [("system", "系统盘"), ("local", "资源盘 1"), ("local", "资源盘 2"),
              ("115", "115 网盘"), ("pikpak", "PikPak 网盘")],
         )
+        # 这几个根都不存在，认不出所在的卷，按根各算一卷。
         self.assertEqual(stats["storage_summary"], {
             "volumes": 5, "online": 5, "measured": 5,
             "free": 100, "used": 400, "total": 500,
+        })
+
+    def _storage_stats_for(self, system, declarations, volume_key=None):
+        """按给定的系统卷与来源根算一次存储卷汇总；每个根都在线、读到同一份 20/100 容量。"""
+        usage = type("Usage", (), {"free": 20, "total": 100})
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(web_stats, "LOCATION_ROOT_DECLARATIONS", declarations))
+            stack.enter_context(mock.patch.object(web_stats, "system_volume", return_value=system))
+            stack.enter_context(mock.patch.object(
+                web_stats, "translate_ledger_path", side_effect=lambda value: Path(value)))
+            stack.enter_context(mock.patch.object(web_stats, "root_online", return_value=True))
+            stack.enter_context(mock.patch("shutil.disk_usage", return_value=usage))
+            if volume_key is not None:
+                stack.enter_context(mock.patch.object(web_stats, "_volume_key", side_effect=volume_key))
+            stats = rm_web.q_stats(self.contract)
+        for row in stats["storage_volumes"]:
+            self.assertEqual(set(row), {"kind", "label", "root", "online", "free", "used", "total"})
+        return stats
+
+    def test_storage_summary_counts_roots_on_one_disk_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            roots = (str(Path(tmp) / "a"), str(Path(tmp) / "b"))
+            for root in roots:
+                Path(root).mkdir()
+            stats = self._storage_stats_for(Path("X:/"), {"local": roots})
+        self.assertEqual([row["label"] for row in stats["storage_volumes"]],
+                         ["系统盘", "资源盘 1", "资源盘 2"])
+        self.assertEqual(stats["storage_summary"], {
+            "volumes": 2, "online": 2, "measured": 2,
+            "free": 40, "used": 160, "total": 200,
+        })
+
+    def test_storage_summary_counts_media_roots_on_the_system_disk_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            roots = (str(Path(tmp) / "a"), str(Path(tmp) / "b"))
+            for root in roots:
+                Path(root).mkdir()
+            stats = self._storage_stats_for(Path(tmp), {"local": roots})
+        self.assertEqual(len(stats["storage_volumes"]), 3)
+        self.assertEqual(stats["storage_summary"], {
+            "volumes": 1, "online": 1, "measured": 1,
+            "free": 20, "used": 80, "total": 100,
+        })
+        self.assertEqual(stats["system_disk"]["total"], 100)
+
+    def test_storage_summary_adds_up_different_disks(self):
+        declarations = {"local": ("R:/media", "R:/more", "S:/media"), "115": ("B:/",)}
+        stats = self._storage_stats_for(
+            Path("X:/"), declarations,
+            volume_key=lambda root: ("device", str(root)[0]))
+        self.assertEqual(len(stats["storage_volumes"]), 5)
+        self.assertEqual(stats["storage_summary"], {
+            "volumes": 4, "online": 4, "measured": 4,
+            "free": 80, "used": 320, "total": 400,
         })
 
     def test_items_support_duration_range(self):

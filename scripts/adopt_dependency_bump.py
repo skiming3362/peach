@@ -96,7 +96,7 @@ RECIPES = {
     },
     "actions": {
         "label": "GitHub Actions 工作流",
-        "manifests": (".github/workflows/",),
+        "manifests": (".github/workflows/", ".github/actions/setup-ffmpeg/"),
         "derived": (),
         "commands": (),
         "checks": (),

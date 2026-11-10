@@ -132,8 +132,12 @@ def main() -> None:
     parser.add_argument("--phase", choices=("complete", "frontend"), default="complete")
     args = parser.parse_args()
     if args.verify_results:
-        validate_results(json.loads(os.environ["RESULTS"]), json.loads(os.environ["REQUIRED_JOBS"]),
-                         phase=args.phase)
+        results = json.loads(os.environ["RESULTS"])
+        if not os.environ.get("REQUIRED_JOBS", "").strip():
+            # plan 没跑到（上游失败或取消）时这里是空串；报出真正失败的上游，而不是 JSON 解析错误。
+            upstream = {name: item.get("result") for name, item in results.items() if item.get("result") != "success"}
+            raise SystemExit(f"验证计划未生成，上游任务未通过：{upstream}")
+        validate_results(results, json.loads(os.environ["REQUIRED_JOBS"]), phase=args.phase)
         return
     if not args.event or not args.base:
         parser.error("生成计划需要 --event 与 --base")

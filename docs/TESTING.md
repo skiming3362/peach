@@ -204,7 +204,7 @@ macOS 按影响域验证：
 
 全量先单独跑一片秒级检查（`test_runner.GATE_TESTS`：仓库策略、编码、文案终态、上下文预算、源码断言棘轮、复杂度、Python lint、外发代理、仓库整洁与依赖清单，合计约 1 分钟），有一项不过就不起其余分片。
 
-全量失败后，入口从逐条结果里取出失败的 Python 用例、e2e 文件与 vitest 文件，不超过 6 个文件时用定向入口逐个单独重跑一次。单独重跑通过的，记录照样签为通过，名字写进记录的 `flaky` 字段并打印出来；单独重跑仍失败、失败面更大、或浏览器容器整个没起来的，按真实失败处理。同一用例反复出现在 `flaky` 里，说明它的等待写法或时限需要修。
+全量失败后，入口从逐条结果里取出失败的 Python 用例、e2e 文件与 vitest 文件，不超过 6 个文件时用定向入口逐个单独重跑一次。单独重跑通过的，记录照样签为通过，名字写进记录的 `flaky` 字段并打印出来；单独重跑仍失败、失败面更大、或浏览器容器整个没起来的，按真实失败处理。CI 的独立 Python 分片同样处理；浏览器分片走定向入口，由 `-RerunFailures`（macOS/Linux 为 `--rerun-failures`）开启同一处理。偶发通过时写进测试结果历史；在 GitHub Actions 上另标为警告并写进作业摘要，PR 上可见。同一文件反复偶发，说明它的等待写法或时限需要修；`python scripts/test_history.py flaky` 按次数排行，`--folder` 可另读下载的 CI 历史制品。
 
 本机全量验证与代码集成共用 `full-suite.lock`，从取得代码和环境快照一直持有到记录写入完成。仅修改两份 README 或 `docs/` 下 Markdown 的集成只取得 `integration.lock`，仍核对工作树、验证记录与冲突，不等待无关全量测试。
 锁忙时按到达先后排队：等待者在锁旁的 `full-suite.lock.queue/` 放一张以纳秒时刻开头的票，
@@ -376,6 +376,8 @@ PowerShell 里解析到 `Git\cmd\git.exe`、在 Git Bash 里解析到 `Git\mingw
 | `files`、`count` | 本次跑到的测试文件模块名与用例总数 |
 
 之后逐条写 `type` 为 `test` 的行：`run`、`id`、`outcome`（`pass`、`fail`、`error`、`skip`）与 `seconds`，失败与报错另有 `message`，取最后一行异常，遮掉 `token=`、`password=` 一类的值，截断到 200 字。Python 用例名为 `模块.类.方法`，vitest 为 `vitest:文件 > 分组 > 标题`，浏览器用例为 `e2e:文件 > 分组 > 标题`。
+
+偶发另写一行 `type` 为 `flaky`：`time`、`head`、`branch`、`worktree`、`ci` 与单独重跑通过的 `selectors`。
 
 为控制体积，只逐条写非通过的用例与耗时不少于 5 秒的通过用例。一次全量约一万条结果，全部逐条写约 2.4 MB；按这个口径约 250 行、75 KB。某条用例跑了几次，用运行头的 `files` 推算：文件在场、没被记成 `skip` 的用例都跑过；逐文件耗时另见 `test-timings.json`。
 
