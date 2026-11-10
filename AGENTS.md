@@ -3,6 +3,13 @@
 本文件是 Codex 与 Claude 共用的项目约定入口；项目与运行方式见 `README.md`。分层与清退见 `docs/adr/0015-agent-context-layering.md`，不要默认追加规则。
 公开文档与技能正文使用中文，技术标识保留英文；写作按用户级 `tech-doc-style-chinese` 和 `docs/WRITING.md`。回复简洁，结尾包含「我做了什么」「你需要做什么」。
 
+## 本机部署
+
+- 当前工作区是 Peach 源码检出；这台电脑安装的 Peach 数据目录在 `D:\project\peach`，账本是其中的 `database/ledger.db`。
+- **上游 `peach-mitao/peach` 只读。** 不向上游提 PR、issue、评论，不推分支；改动只落到自己的 fork `skiming3362/peach`。功能分支只推 fork，不新建 PR。
+- 本机相关流程写在数据根 `D:\project\peach\state\project-context\`：`fork-sync.md`（三仓库关系与同步）、`install-local-build.md`（改完之后如何构建安装包并装到本机）。
+- 构建安装包、重建前端产物（`web/dist`）与跑全量测试由我手工做，智能体不代为执行；智能体只交付代码与可复现的命令。
+
 ## 授权与保护
 
 - 在授权范围内完成修改、必要验证和失败修复，保留用户改动。真实 ledger 写入、不可逆删除、生产入口切换、凭据与私钥操作，须在同一轮取得明确授权。
@@ -10,7 +17,7 @@
 - ledger 的 `asset.path` 保持 Windows 形态，由 `src/peach/platform.py` 读取转换；不得改写成 POSIX 路径或从 macOS 写 `asset.path`。
 - 代码判据确定、能按来源整批撤回的断言按 ADR-0052 落库；LLM 输出、打分、冲突与多候选只产生候选，不得自行标为 `approved`。真实写入执行 `peach-ledger-write`。
 - 编辑前核对 `git status`。代码任务使用 `scripts/agent_worktree.py create` 的隔离工作树，主检出负责集成；先读 `peach-worktree`。
-- 代码改动经 PR 交付，维护者自身也适用；issue 范围与交付流程见 `peach-issue-delivery`。
+- 代码改动经 PR 交付，维护者自身也适用；issue 范围与交付流程见 `peach-issue-delivery`。**本机例外**：改动只落在这个 fork 内，走本机工作树流程，不向上游提 PR、issue 或评论（见「本机部署」）。
 - 替他人开 issue 按 `CONTRIBUTING.md`「开 Issue」：用 `.github/ISSUE_TEMPLATE/` 的模板章节和 `gh issue create --type`，写通用技术说法；本文件的术语与交付格式只用于改代码。
 - 服务、端口或重启操作先核对监听与进程归属。已提交且测试通过的适用代码用 `restart_windows_tray.py` 重启并核验；手动或 CLI 发起的主任务仍在跑时先问，其余任务均能续跑时直接重启。
 - `agent_worktree.py prune --apply` 可回收入口判定安全的工作树；只按 PID 清理本任务创建的进程，保护活动工作树、忽略文件与其他任务。
