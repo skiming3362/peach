@@ -4,10 +4,13 @@
  * route() 留在应用导航域，因为它还要同步标题与界面动作。 */
 import { entityLinkId, registerEntityLink, registerResponseEntities } from './entity-links';
 import { SOURCE_LABELS } from './media-sources';
-import { requestErrorMessage } from './request-error';
+import { markResolved, requestErrorMessage } from './request-error';
+import { serverText } from './server-text';
+import { noticeFailedResponse, noticeRequestFailure } from './service-status';
 import { iconGeometry } from './icon-geometry';
 import { libraryScopedPath } from './library-scope';
 import { t } from '../i18n';
+import { linkLabel } from './stored-values';
 export { registerEntityLink, registerResponseEntities } from './entity-links';
 export { requestErrorMessage } from './request-error';
 const $=(s:string)=>document.querySelector(s);
@@ -26,12 +29,13 @@ const api=async(p:string,o?:RequestInit):Promise<unknown>=>{
   const init:RequestInit={headers:{'Content-Type':'application/json'},...rest};
   if(signal)init.signal=signal;
   let response:Response;
-  try{response=await fetch(p,init)}catch(error:any){if(error?.name==='AbortError')throw error;throw new Error(requestErrorMessage(error),{cause:error})}
+  try{response=await fetch(p,init)}catch(error:any){noticeRequestFailure(error);if(error?.name==='AbortError')throw error;throw markResolved(new Error(requestErrorMessage(error),{cause:error}))}
   let payload:any=null;
   try{payload=await response.json()}catch{}
   if(!response.ok){
-    const detail=payload&&(payload.message||payload.detail||payload.error);
-    throw new Error(requestErrorMessage(detail,response.status));
+    noticeFailedResponse(response.status,payload);
+    const reason=serverText(payload);
+    throw markResolved(new Error(reason||requestErrorMessage('',response.status)));
   }
   registerResponseEntities(p,payload);
   return payload;
@@ -142,11 +146,10 @@ const foldName=(s:unknown)=>String(s??'').normalize('NFKC').trim().toLocaleLower
 const ARCHIVE_HOSTS=['web.archive.org'];
 const isArchiveLink=(url:unknown)=>ARCHIVE_HOSTS.includes(linkHost(url));
 const officialLinkText=(link:{url?:string;label?:string},kind:string,names:readonly string[]=[])=>{
-  const text=siteName(link.url)||link.label||'';
+  const text=siteName(link.url)||linkLabel(link.label);
   if((kind!=='studio'&&kind!=='agency')||isArchiveLink(link.url))return text;
   const said=[text,link.label].map(foldName).filter(Boolean);
-  // i18n-exempt: 比对服务端链接 label 里的中文原值，显示走译文
-  const own=!said.length||said.includes('官方网站')||said.some(shown=>
+  const own=!said.length||said.includes('official-site')||said.some(shown=>
     bareHost(shown)===linkHost(link.url)||names.some(name=>{
       const folded=foldName(name);
       return Boolean(folded)&&(folded.includes(shown)||shown.includes(folded));

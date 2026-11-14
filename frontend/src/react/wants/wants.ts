@@ -52,6 +52,8 @@ export interface WantsData {
   counts: Record<Phase, number>;
   /** 取资料那一轮还在跑：刚登记的那几条资料还没回来。 */
   scraping: boolean;
+  /** 定时查资源那一轮还在跑：卡片上的查找结果会陆续更新。 */
+  searching: boolean;
 }
 
 export const fetchWants = (signal?: AbortSignal) => apiGet<WantsData>(WANTS_URL, signal);
@@ -90,4 +92,15 @@ export function searchNote(want: Want): string {
   if (want.phase === 'given_up') return t('catalog:wants.givenUpNote', { count: want.search_count });
   if (want.fresh) return t('catalog:wants.freshNote');
   return want.search_count ? t('catalog:wants.searchCount', { count: want.search_count }) : t('catalog:wants.notSearched');
+}
+
+/** 有番号、还在找的那一条上次定时查找没查到或失败时的日期；老片没查到时带上已查次数（满三次暂时放弃）。
+ * 查到的不写：资源区已经列出了查到的链接。 */
+export function lastSearchNote(want: Want): string {
+  if (!want.last_search_at || !want.last_search_outcome || want.last_search_outcome === 'found') return '';
+  const date = want.last_search_at.slice(0, 10);
+  if (want.last_search_outcome === 'error') return t('catalog:wants.lastSearchError', { date });
+  const text = t('catalog:wants.lastSearchNone', { date });
+  return want.fresh || !want.search_count ? text
+    : t('shell:format.withNote', { text, note: t('catalog:wants.searchCount', { count: want.search_count }) });
 }

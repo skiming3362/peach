@@ -1,11 +1,15 @@
-/** 页面持续读取已提交结果；仅使发生变化的资料缓存失效。新到的入库通知弹 toast。 */
+/** 页面持续读取已提交结果；仅使发生变化的资料缓存失效。新到的入库通知弹 toast。
+ *  这也是全站唯一常驻的那一处检查：在排在跑的任务（`running_tasks`）由它带来，别的页面只读缓存
+ *  （`running-tasks.ts`），据此决定要不要开始盯自己那份进度。 */
 import { useEffect, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import type { ShellActions } from './router/shell-actions';
 
 import {
-  fetchResultUpdates, RESULT_UPDATES_KEY, RUNNING_POLL_MS, SETTLED_POLL_MS, type ActivityData, type IngestNotice,
+  fetchResultUpdates, RESULT_BUSY_POLL_MS, RESULT_IDLE_POLL_MS, RESULT_UPDATES_KEY, type ActivityData, type IngestNotice,
+  type ResultUpdatesData,
 } from './activity/tasks';
+import { withBackoff } from '../polling';
 import { queryClient } from './query';
 import { showToast } from './toaster';
 import { t } from '../i18n';
@@ -14,7 +18,7 @@ const CATALOG = ['catalog-grid', 'catalog-folders', 'item', 'item-related', 'ite
   'entity', 'entity-items', 'entity-photos', 'entity-route', 'index', 'stats',
   'quality-goals', 'duplicates', 'orphan-records', 'trash-summary', 'junk-summary', 'immerse-list'];
 const FOLLOW = ['follow-feed', 'follow-item', 'follow-manage', 'follow', 'entity', 'index'];
-const DISCOVERIES = ['feed-new', 'jav-discoveries', 'jav-detail', 'wants', 'index'];
+const DISCOVERIES = ['feed-new', 'jav-discoveries', 'jav-releases', 'jav-detail', 'wants', 'index'];
 /* 每个版本键刷新的页面，要覆盖服务端按表缓存的那几页实际读到的表：统计页读关注条目与来源
    算在线播放，口味页读关注来源推账号，所以它们也跟着 `follow` 刷新。对照见
    `tests/test_ledger_revision.py` 的 `ResultVersionTablesTests`。 */
@@ -79,9 +83,13 @@ export function announceIngests(seen: { epoch: string; last: number } | null,
   return { epoch: notices.epoch, last: Math.max(seen.last, last) };
 }
 
+/** 有任务在排在跑时五秒一次，闲着十秒一次；读失败按 4、8、16、30 秒退避，成功一次就回到常规间隔。 */
+export const resultUpdatesInterval = withBackoff<ResultUpdatesData>((data) =>
+  (data?.busy ? RESULT_BUSY_POLL_MS : RESULT_IDLE_POLL_MS));
+
 export function ResultUpdates({ openItem }: Pick<ShellActions, 'openItem'>) {
   const query = useQuery({ queryKey: RESULT_UPDATES_KEY, queryFn: ({ signal }) => fetchResultUpdates(signal),
-    refetchInterval: current => (current.state.data?.busy ? RUNNING_POLL_MS : SETTLED_POLL_MS) });
+    refetchInterval: resultUpdatesInterval });
   const previous = useRef<Record<string, string> | undefined>(undefined);
   const announced = useRef<{ epoch: string; last: number } | null>(null);
   const [refresh] = useState(createResultRefresher);

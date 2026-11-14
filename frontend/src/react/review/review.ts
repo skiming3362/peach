@@ -14,6 +14,7 @@ import { selectRange } from '../../selection';
 import { queryClient } from '../query';
 import { localTime } from '../time';
 import { t } from '../../i18n';
+import { codedText, partsLabel, serverLabel, type TextPart } from '../../core/server-text';
 
 export const REVIEW_URL = '/api/review';
 export const REVIEW_DECISION_URL = '/api/review/decision';
@@ -54,7 +55,11 @@ export const ENTITY_REVIEW_KINDS: Partial<Record<ReviewCategory, string>> = {
 /** 默认每页 20 张；接口读取整条队列，页面按所选数量挂载候选表单。 */
 export const REVIEW_PAGE_SIZE = 20;
 
-export interface CatalogEvidence { display_value?: string; warnings?: string[] }
+/** 来源顺带交回的一项旁证：`display_value`、`warnings` 是 zh-CN 原句，旁边的 code 与参数给当前语言。 */
+export interface CatalogEvidence {
+  display_value?: string; display_value_code?: string; display_value_params?: Record<string, unknown>;
+  warnings?: string[]; warning_codes?: (string | null)[]; warning_params?: (Record<string, unknown> | null)[];
+}
 
 /** 一个来源给出的候选值。选中它就是把 `display_value` 写进数据库。 */
 export interface ReviewCandidate {
@@ -65,6 +70,8 @@ export interface ReviewCandidate {
   provider_id?: string;
   display_value?: string;
   warnings?: string[];
+  warning_codes?: (string | null)[];
+  warning_params?: (Record<string, unknown> | null)[];
   /** 同一来源顺带交回来的其它字段，只作判断依据。 */
   catalog_evidence?: Record<string, CatalogEvidence>;
   /** 静态词表还没收录的 genre。 */
@@ -105,6 +112,8 @@ export interface ReviewRow {
   /** 竖线分隔的候选标签。 */
   tags?: string;
   reason?: string;
+  /** 服务端拼的证据句（`reason`）按段的 code；`text` 是来源原文。 */
+  reason_parts?: TextPart[];
   evidence?: string;
   note?: string;
   decision_note?: string;
@@ -137,6 +146,8 @@ export interface ReviewMirror {
   origin?: string | null;
   fetched_at?: string | null;
   error?: string | null;
+  error_code?: string | null;
+  error_params?: Record<string, unknown> | null;
   read_only?: boolean;
 }
 
@@ -197,7 +208,7 @@ export function groupReviewRows(rows: ReviewRow[], by: ReviewGrouping): ReviewGr
     let title: string;
     if (by === 'field') {
       key = row.field || '__unspecified_field';
-      title = row.field_label || row.field || t('manage:reviewQueue.unspecifiedField');
+      title = fieldName(row) || t('manage:reviewQueue.unspecifiedField');
     } else if (by === 'source') {
       const sources = [...new Set((row.candidates?.map((candidate) => candidate.source || '')
         || [row.source || '']).filter(Boolean))].sort();
@@ -266,8 +277,23 @@ export function rowSubject(category: ReviewCategory, row: ReviewRow): string {
   return String(row.creator || row.studio || row.current_name || row.name || row.item_key);
 }
 
+/** 候选表 `field` 列的字段 id 到显示名的 code（`server.json`，与自动写入页同一份）。 */
+const FIELD_NAME_CODES: Readonly<Record<string, string>> = {
+  title: 'labels.webAutoLandings.fieldTitle', original_title: 'labels.webAutoLandings.fieldOriginalTitle',
+  performers: 'labels.webAutoLandings.fieldPerformers', studio: 'labels.webAutoLandings.fieldStudio',
+  series: 'labels.webAutoLandings.fieldSeries', release_date: 'labels.webAutoLandings.fieldReleaseDate',
+  tags: 'labels.webAutoLandings.fieldTags',
+};
+
+/** 字段名按当前语言取；候选表里登记之外的字段照原样显示脚本写的 `field_label`。 */
+export function fieldName(row: ReviewRow): string {
+  const field = row.field || '';
+  const original = String(row.field_label || field).trim();
+  return Object.hasOwn(FIELD_NAME_CODES, field) ? serverLabel(FIELD_NAME_CODES[field]!, original) : original;
+}
+
 export const rowFieldName = (category: ReviewCategory, row: ReviewRow): string =>
-  (category === 'metadata_fields' ? String(row.field_label || row.field || '').trim() : '');
+  (category === 'metadata_fields' ? fieldName(row) : '');
 
 export function rowTitle(category: ReviewCategory, row: ReviewRow): string {
   const subject = rowSubject(category, row);
@@ -275,8 +301,9 @@ export function rowTitle(category: ReviewCategory, row: ReviewRow): string {
   return field ? `${subject} · ${field}` : subject;
 }
 
+/** 证据句逐段取译文（`partsLabel`）：缺一段译文就整句用服务端原文。 */
 export const rowEvidence = (row: ReviewRow): string =>
-  row.reason || row.evidence || row.note || row.decision_note || '';
+  partsLabel(row.reason_parts, row.reason || '') || row.evidence || row.note || row.decision_note || '';
 
 export const rowTags = (row: ReviewRow): string[] =>
   String(row.tags || '').split('|').filter(Boolean);
@@ -421,5 +448,5 @@ export function mirrorText(
 ): string {
   if (mirror?.state === 'live') return t('manage:reviewQueue.mirrorLive');
   if (mirror?.state === 'cached') return t('manage:reviewQueue.mirrorCached', { time: localTime(mirror.fetched_at) });
-  return mirror?.error || readOnlyMessage;
+  return (mirror?.error ? codedText(mirror, 'error') : '') || readOnlyMessage;
 }

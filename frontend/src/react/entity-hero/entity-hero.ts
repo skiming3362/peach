@@ -8,6 +8,7 @@ import { brandIcon, foldName, linkMarkUrl, officialLinkText } from '@peach/legac
 import type { FeedNew } from '../feed-new/feed-new';
 import type { PendingWorkItem } from '../components/pending-work';
 import { t } from '../../i18n';
+import { linkLabel } from '../../core/stored-values';
 
 /** 一条外链，形状同 `/api/entity` 的 `links[]`。 */
 export interface HeroLink {
@@ -62,7 +63,8 @@ export interface HeroNameGroups {
   reading?: string;
   shown?: string[];
   total?: number;
-  groups?: { label?: string; names: { name: string; reading?: string }[] }[];
+  /** 固定的三组（现名、旧名义、其它）带 `label_code`；各渠道名义的 `label` 是资料站上的注记原文。 */
+  groups?: { label?: string; label_code?: string; names: { name: string; reading?: string }[] }[];
 }
 
 /** 创作者名下的关注来源（ADR-0096）。`key` 是关注页的作者键，没绑来源时是空串；`held` 是
@@ -83,6 +85,8 @@ export interface EntityHeroData {
   pending_work?: PendingWorkItem[];
   company_profile?: Partial<Record<'legal_name' | 'founded' | 'launched' | 'country' | 'location' | 'operator' | 'parent' | 'group' | 'distributor', { value: string; source_url: string; evidence?: string }>>;
   identity_labels?: string[];
+  /** 与 `identity_labels` 一一对应的分类 id，按它取译文。 */
+  identity_categories?: string[];
   external_refs?: { provider: string; external_kind: string; external_id: string }[];
   related_identities?: { id: number; kind: string; canonical_name: string; relation: string }[];
   id: number;
@@ -190,7 +194,7 @@ export function agencyOf(entity: EntityHeroData): { name: string; linked: boolea
 export function performerLinkName(link: HeroLink, agency: string): string {
   const text = officialLinkText(link, 'performer'), home = foldName(agency);
   const own = home && [link.label, text].map(foldName).some((said) => said && (home.includes(said) || said.includes(home)));
-  return own ? t('catalog:entityFacts.agencyProfile', { agency }) : (text || link.label || '');
+  return own ? t('catalog:entityFacts.agencyProfile', { agency }) : (text || linkLabel(link.label));
 }
 
 /** 链接前那枚圆标：常见社媒走雪碧图里的品牌字形，其余取服务端合成的站点圆标，取不到露出地球。 */
@@ -219,15 +223,15 @@ export function heroLinks(entity: EntityHeroData, kind: string): LinkView[] {
       return { type: 'gone', title: `${performerLinkName(x, agency)} · ${why}` };
     }
     const url = x.url || '';
-    if (!(x.clickable && /^https?:\/\//i.test(url))) return { type: 'private', label: x.label || x.hostname || t('catalog:entityFacts.onFile') };
+    if (!(x.clickable && /^https?:\/\//i.test(url))) return { type: 'private', label: linkLabel(x.label) || x.hostname || t('catalog:entityFacts.onFile') };
     if (isPeople(kind) && x.link_kind !== 'social') {
       return { type: 'icon', url, title: performerLinkName(x, agency), mark: siteMark(x) };
     }
     if (x.link_kind === 'social') {
       const brand = brandIcon(url);
-      return { type: 'icon', url, title: x.label || '', mark: brand ? { brand } : siteMark(x) };
+      return { type: 'icon', url, title: linkLabel(x.label), mark: brand ? { brand } : siteMark(x) };
     }
-    return { type: 'url', url, title: x.label || '', text: officialLinkText(x, kind, names), mark: siteMark(x) };
+    return { type: 'url', url, title: linkLabel(x.label), text: officialLinkText(x, kind, names), mark: siteMark(x) };
   });
   return [...pills, ...foldPrivate(links)];
 }

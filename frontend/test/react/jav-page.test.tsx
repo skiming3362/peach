@@ -31,7 +31,7 @@ it('发现已有结果即时呈现，陈旧推荐在后台更新', async () => {
 });
 
 it('想要已有清单立即返回，陈旧数据在后台更新', async () => {
-  const cached = { items: [], counts: {}, scraping: false };
+  const cached = { items: [], counts: {}, scraping: false, searching: false };
   queryClient.setQueryData(WANTS_KEY, cached, { updatedAt: Date.now() - 60_000 });
   let finish!: (response: Response) => void;
   const request = new Promise<Response>(resolve => { finish = resolve });

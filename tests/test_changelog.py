@@ -188,6 +188,25 @@ class SectionTests(unittest.TestCase):
         linked = "字" * (changelog.ENTRY_LIMIT - 2) + "[说明](docs/DOCKER.md#一键更新可选-watchtower)"
         changelog.require_labeled_entries(head + linked + "\n", "0.8.0")
 
+    def test_entries_after_0_58_0_must_cite_an_issue_or_pull_request(self):
+        """0.58.0 之后与「未发布」段的条目句末带 issue 或 PR 编号；跨仓库写 owner/repo#编号；更早的版本不追补。"""
+        bare = "\n### 修复\n\n- **界面**：修好一处界面。\n"
+        for version in ("0.58.1", "0.59.0", "未发布"):
+            heading = f"## [{version}]" + ("" if version == "未发布" else " - 2026-11-20") + "\n"
+            with self.subTest(version=version), self.assertRaisesRegex(VersionError, "来源编号"):
+                changelog.require_labeled_entries(heading + bare, version)
+        for cited in ("修好一处界面（#651）。", "修好一处界面（#650、#651）。",
+                      "修好一处界面（peach-mitao/peach-userscript#28）。"):
+            with self.subTest(cited=cited):
+                changelog.require_labeled_entries(
+                    "## [0.59.0] - 2026-11-20\n\n### 修复\n\n- **界面**：" + cited + "\n", "0.59.0")
+        # 色号、锚点里的 # 不算编号；0.58.0 及更早照旧放行。
+        with self.assertRaisesRegex(VersionError, "来源编号"):
+            changelog.require_labeled_entries(
+                "## [0.59.0] - 2026-11-20\n\n### 修复\n\n- **界面**：强调色改成 #0043ce，见 [说明](docs/A.md#b)。\n",
+                "0.59.0")
+        changelog.require_labeled_entries("## [0.58.0] - 2026-11-14" + bare, "0.58.0")
+
     def test_an_overlong_entry_in_an_older_release_also_blocks_the_release(self):
         """旧版本改写时也守住上限：任一已发布版本有超长条目，新版本就不能定版；旧版本没有标签也照样按字数算。"""
         current = "## [0.8.0] - 2026-09-19\n\n### 修复\n\n- **界面**：修好一处界面。\n\n"
@@ -357,6 +376,10 @@ class ShippedChangelogTests(unittest.TestCase):
             with self.subTest(version=version):
                 self.assertRegex(self.document,
                                  rf"(?m)^\[{re.escape(version)}\]: https://github\.com/")
+
+    def test_the_unreleased_section_already_passes_the_release_checks(self):
+        """分支写进「未发布」的条目在合入前就按定版的检查过一遍，缺编号、超长不留到发版时才发现。"""
+        changelog.require_labeled_entries(self.document, "未发布")
 
     def test_every_entry_carries_a_label_from_the_closed_vocabulary(self):
         allowed = "|".join(changelog.AREAS)

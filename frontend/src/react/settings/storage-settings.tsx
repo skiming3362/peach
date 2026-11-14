@@ -16,25 +16,30 @@ import { Checkbox } from '@/components/base/checkbox/checkbox';
 
 import { ApiError, apiGet, apiSend, errorMessage } from '../../api';
 import { PICK_FOLDER_URL } from '../../configuration-endpoints';
-import type { StorageCategory, StorageState } from '../bundle';
+import { bodyFieldErrors, codedText, serverLabel, serverText } from '../../core/server-text';
+import type { StorageCategory, StorageRelocation, StorageState } from '../bundle';
 import { AnimatedNumber } from '../components/animated-number';
 import { cardClass } from '../components/card';
-import { LoadingDots } from '../components/loading-dots';
+import { ActivityStatus } from '../components/activity-motion';
 import { PathLine } from '../components/path-line';
+import { pickServerFolder, type FolderReply } from '../components/server-path-dialog';
 import { Progress } from '../components/progress';
 import { CommandSteps, ErrorText, Fact, FactList, Footer, Help, Stack, Section, translateWithNodes } from './section';
 import { CATEGORY_SWATCH, REST_SWATCH, StorageOverview } from './storage-charts';
 import { busyProps, useAction } from './use-action';
 import { StorageBudgetSettings } from './storage-budget-settings';
-import { joinList, t } from '../../i18n';
+import { pollUntil } from '../../polling';
+import { interfaceLanguage, joinList, t } from '../../i18n';
 
 const STORAGE_URL = '/api/configuration/storage';
 const POLL_MS = 1500;
+/** 一轮统计或清理最多跟这么久。 */
+const POLL_LIMIT_MS = 60 * 60_000;
 /** 迁移完成的回执留一天；之后只在还有要处理的事（备注）时显示。 */
 const RESULT_MS = 24 * 3600 * 1000;
 
 const targetReason = (cause: unknown) =>
-  (cause instanceof ApiError && (cause.body as { errors?: { target?: string } } | null)?.errors?.target)
+  (cause instanceof ApiError && bodyFieldErrors<{ target?: string }>(cause.body)?.target)
   || errorMessage(cause);
 
 function diskLine(storage: StorageState) {
@@ -44,8 +49,23 @@ function diskLine(storage: StorageState) {
 }
 
 const cleanable = (category: StorageCategory) => category.cleanable && category.reclaimable > 0;
+/** 类别名、说明与清理后果按 key 取当前界面语言，没有译文的照用服务端的中文。 */
+const localizeCategory = (category: StorageCategory): StorageCategory => ({
+  ...category,
+  label: serverLabel(`storage.category.${category.key}.label`, category.label),
+  description: serverLabel(`storage.category.${category.key}.description`, category.description),
+  note: serverLabel(`storage.category.${category.key}.note`, category.note),
+});
 
-/** 统计进行中：知道上次有多少文件就画进度条，不知道就只说走过多少。 */
+/** 迁移回执的原因与备注，按当前界面语言；`note_codes` 与 `notes` 同序，缺 code 的备注照原文。 */
+const relocationLines = (last: StorageRelocation) =>
+  [codedText(last, 'message'), ...(last.notes ?? []).map((note, index) =>
+    serverLabel(last.note_codes?.[index]?.code ?? '', note, last.note_codes?.[index]?.params))];
+/** 宿主机上的迁移步骤：说明与带占位名的命令都按当前界面语言。 */
+const localizeStep = (step: { text: string; command: string }) =>
+  ({ text: codedText(step, 'text'), command: codedText(step, 'command') });
+
+/** 统计进行中：知道上次有多少文件就按它画一条估算的进度条（文案写明是估算），不知道就画检查动画、只说走过多少。 */
 function Measuring({ job }: { job: StorageState['job'] }) {
   const files = job.files || 0;
   const expected = job.expected_files || 0;
@@ -58,7 +78,7 @@ function Measuring({ job }: { job: StorageState['job'] }) {
             <Progress label={t('settings:storageSpace.measureProgress')} value={Math.min(files, expected * 0.99)} max={expected} />
             <Help>{translateWithNodes('settings:storageSpace.measuringOfLast', { count: files, expected }, nodes)}</Help>
           </>
-        : <LoadingDots label={t('settings:storageSpace.measuringLabel')} />}
+        : <ActivityStatus kind="radar" label={t('settings:storageSpace.measuringLabel')} />}
       {!expected ? <Help>{translateWithNodes('settings:storageSpace.measuring', { count: files }, nodes)}</Help> : null}
     </div>
   );
@@ -107,16 +127,18 @@ export function StorageSettings({ initial, receipt }: { initial: StorageState; r
     void action.run('measure', signal => apiSend<StorageState>(`${STORAGE_URL}/measure`, {}, 'POST', signal), setStorage);
   }, []);
 
+  /* 有一轮在跑时 1.5 秒读一次，读失败退避，页面不可见时暂停，跑满上限就停。 */
   useEffect(() => {
     if (!running) return;
     const controller = new AbortController();
-    const timer = setTimeout(() => {
-      apiGet<StorageState>(STORAGE_URL, controller.signal).then(setStorage, () => {
-        if (!controller.signal.aborted) setStorage((current) => ({ ...current }));
-      });
-    }, POLL_MS);
-    return () => { controller.abort(); clearTimeout(timer); };
-  }, [storage]);
+    void pollUntil({
+      signal: controller.signal, everyMs: POLL_MS, limitMs: POLL_LIMIT_MS,
+      read: (signal) => apiGet<StorageState>(STORAGE_URL, signal),
+      apply: setStorage,
+      done: (next) => next.job.state === 'idle',
+    });
+    return () => controller.abort();
+  }, [running]);
 
   // 一轮统计或清理结束：成功的回执走 Toast，失败的原因留在分区里；清掉的类别不再勾着。
   useEffect(() => {
@@ -124,13 +146,13 @@ export function StorageSettings({ initial, receipt }: { initial: StorageState; r
     if (!reported.current) return;
     reported.current = false;
     setPicked(new Set());
-    if (!storage.job.error) receipt(storage.job.message || t('settings:storageSpace.measured'));
+    if (!storage.job.error) receipt(codedText(storage.job, 'message') || t('settings:storageSpace.measured'));
   }, [running]);
 
   const measure = () => void action.run('measure', (signal) =>
     apiSend<StorageState>(`${STORAGE_URL}/measure`, {}, 'POST', signal), setStorage);
 
-  const usage = storage.usage;
+  const usage = storage.usage && { ...storage.usage, categories: storage.usage.categories.map(localizeCategory) };
   const available = usage?.categories.filter(cleanable) ?? [];
   const chosen = available.filter((category) => picked.has(category.key));
 
@@ -149,7 +171,8 @@ export function StorageSettings({ initial, receipt }: { initial: StorageState; r
   };
 
   const relocate = () => void action.run('relocate', async (signal) => {
-    const target = (await apiSend<{ path: string | null }>(PICK_FOLDER_URL, { initial: storage.data_root }, 'POST', signal)).path;
+    const target = await pickServerFolder(storage.data_root,
+      body => apiSend<FolderReply>(PICK_FOLDER_URL, body, 'POST', signal), 'data');
     if (!target) return;
     const size = storage.usage ? fmtSize(storage.usage.total_bytes) : '';
     await confirmModal({
@@ -158,7 +181,7 @@ export function StorageSettings({ initial, receipt }: { initial: StorageState; r
       confirmLabel: t('settings:storageSpace.moveDataDirectory'),
       onConfirm: async () => {
         try {
-          setAccepted((await apiSend<{ message: string }>(`${STORAGE_URL}/relocate`, { target })).message);
+          setAccepted(serverText(await apiSend<{ message: string }>(`${STORAGE_URL}/relocate`, { target })));
         } catch (cause) {
           throw new Error(targetReason(cause));
         }
@@ -174,7 +197,7 @@ export function StorageSettings({ initial, receipt }: { initial: StorageState; r
     || (storage.job.state === 'cleaning' ? t('settings:storageSpace.cleaningCategory', { category: cleaningLabel || '' })
       : storage.job.state === 'measuring' ? t('settings:storageSpace.measuringStatus')
         : chosen.length ? t('settings:storageSpace.selectedSummary', { count: chosen.length, size: fmtSize(chosen.reduce((sum, item) => sum + item.reclaimable, 0)) })
-          : usage ? t('settings:storageSpace.measuredAt', { time: new Date(usage.measured_at * 1000).toLocaleString() }) : '');
+          : usage ? t('settings:storageSpace.measuredAt', { time: new Date(usage.measured_at * 1000).toLocaleString(interfaceLanguage) }) : '');
   const locked = running || Boolean(accepted);
   const toggle = (key: string) => (next: boolean) => setPicked((current) => {
     const copy = new Set(current);
@@ -195,7 +218,7 @@ export function StorageSettings({ initial, receipt }: { initial: StorageState; r
         {usage?.allocated_bytes != null ? <Help>{t('settings:storageSpace.allocatedOnDisk')} {fmtSize(usage.allocated_bytes)}</Help> : null}
         {usage
           ? <div data-storage-result="" className={cardClass({ variant: 'outlined', padding: 'none', className: 'flex flex-col' })}>
-              <div className="border-b border-separator-border p-4"><StorageOverview storage={storage} /></div>
+              <div className="border-b border-separator-border p-4"><StorageOverview storage={usage ? { ...storage, usage } : storage} /></div>
               <div className="flex flex-col pl-4">
                 {usage.categories.map((category) => (
                   <CategoryRow key={category.key} category={category} selected={picked.has(category.key)}
@@ -205,16 +228,16 @@ export function StorageSettings({ initial, receipt }: { initial: StorageState; r
             </div>
           : storage.job.state === 'measuring' ? null
             : <Help>{t('settings:diskUsage.emptyHelp')}</Help>}
-        {!storage.relocation.available ? <Help>{storage.relocation.message}</Help> : null}
+        {!storage.relocation.available ? <Help>{codedText(storage.relocation, 'message')}</Help> : null}
         {/* 设置页迁移不了的部署（容器）：宿主机上该做的几步，每步一句说明加一条可照抄的命令。 */}
         {!storage.relocation.available && storage.relocation.steps?.length
-          ? <CommandSteps label={t('settings:storageSpace.moveOnHost')} steps={storage.relocation.steps} />
+          ? <CommandSteps label={t('settings:storageSpace.moveOnHost')} steps={storage.relocation.steps.map(localizeStep)} />
           : null}
-        {storage.job.error ? <ErrorText>{storage.job.message}</ErrorText> : null}
+        {storage.job.error ? <ErrorText>{codedText(storage.job, 'message')}</ErrorText> : null}
         {action.error ? <ErrorText>{action.error}</ErrorText> : null}
         {recent && last ? (last.state === 'error'
-          ? <ErrorText>{last.message}</ErrorText>
-          : <Help>{[last.message, ...(last.notes ?? [])].join('；')}</Help>) : null}
+          ? <ErrorText>{relocationLines(last).join(t('shell:format.semicolonSeparator'))}</ErrorText>
+          : <Help>{relocationLines(last).join(t('shell:format.semicolonSeparator'))}</Help>) : null}
       </Stack>
       <Footer status={status ? <p role={accepted ? 'status' : undefined}>{status}</p> : null}>
         {usage ? <>

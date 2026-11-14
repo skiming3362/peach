@@ -8,6 +8,7 @@
  * 下拉栏的开合动效是全站菜单那一副（遗留层 `presentMenu`／`dismissMenu`，由 `helpers` 递进来）：
  * `hidden` 始终是「看不见了」，壳的全局 Escape 与外点收起照旧读它。 */
 import { t } from '../../i18n';
+import { codedText } from '../../core/server-text';
 
 /** 补全里的一张小封面：作品本身，或人名那一行右边的近作。 */
 export interface SuggestCard {
@@ -43,6 +44,8 @@ export interface SuggestItem {
 export interface SuggestGroup {
   kind: string;
   label: string;
+  /** 服务端补全分组显示名的 code；推荐栏自己拼的组没有。 */
+  label_code?: string;
   total?: number;
   items: SuggestItem[];
   href?: string;
@@ -234,7 +237,7 @@ export function menuModel({ query, history, picks, suggestFor, groups, tabs, kin
     const rows = group.items.map((item) => add({ type: 'suggest', value: item.value, kind: group.kind, item }));
     const more = group.kind === 'asset' && (group.total ?? 0) > rows.length
       ? add({ type: 'more', value: query, total: group.total! }) : undefined;
-    return { kind: group.kind, label: group.label, options: rows, more };
+    return { kind: group.kind, label: codedText(group, 'label'), options: rows, more };
   };
   const left = shown.filter((group) => !SUGGEST_RIGHT_KINDS.has(group.kind)).map(section);
   const right = shown.filter((group) => SUGGEST_RIGHT_KINDS.has(group.kind)).map(section);

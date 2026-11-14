@@ -18,6 +18,7 @@ import { seededRank } from '@peach/legacy/core';
 import { apiGet } from '../../api';
 import { FOLLOW_CREDENTIALS_URL, type CheckResult } from '../follow-manage/follow-manage';
 import { queryClient } from '../query';
+import type { FollowJobView } from '../../jobs';
 import { t } from '../../i18n';
 
 /* ── 地址栏那一组 ── */
@@ -450,7 +451,7 @@ export interface FollowFeedHelpers {
   wireScroller(row: Element | null): void;
   /** 进页整块骨架（`followSkeletonHtml`）之外，换筛选时列表区那一块骨架。 */
   listSkeletonHtml(media: FollowMedia): string;
-  /** 检查更新与往回抓那一趟后台任务的进度条（`peach-ui` 的 `followJobProgress`），作业 id 记在
+  /** 检查更新与往回抓那一趟后台任务的进度（`jobs.ts` 的 `followJobProgress`），作业 id 记在
    *  `sessionStorage` 的 `peach-follow-job`，刷新或换页回来还接得上。 */
   jobProgress(options: FollowJobProgressOptions): void;
 }
@@ -458,8 +459,9 @@ export interface FollowFeedHelpers {
 export interface FollowJobState { status?: string; job_id?: string; error?: string; results?: CheckResult[]; [field: string]: unknown }
 
 export interface FollowJobProgressOptions {
-  host: HTMLElement;
   active(): boolean;
+  /** 那一格要画的东西（`TaskProgress` 或 `Note`）；`null` 收起。 */
+  show(view: FollowJobView | null): void;
   read(signal: AbortSignal): Promise<FollowJobState>;
   busy(running: boolean): void;
   complete(state: FollowJobState): void;

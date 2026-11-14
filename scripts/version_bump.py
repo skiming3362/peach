@@ -11,7 +11,15 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+SRC_DIR = PROJECT_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from peach.interface_text import dev as t  # noqa: E402
 
 #: 版本号的唯一来源。GitHub Release 的 `v<版本>` tag 必须与它相等。
 VERSION_FILE = "src/peach/__init__.py"
@@ -75,7 +83,7 @@ def git(root: Path, *args: str) -> str:
     done = subprocess.run(["git", *args], cwd=str(root), capture_output=True,
                           text=True, encoding="utf-8", check=False)
     if done.returncode != 0:
-        raise VersionError(f"git {' '.join(args)} 失败：{done.stderr.strip()}")
+        raise VersionError(t("version_bump.gitFailed", command=" ".join(args), error=done.stderr.strip()))
     return done.stdout.strip()
 
 
@@ -217,10 +225,11 @@ def readme_link_problems(root: Path) -> list[str]:
         links = DOWNLOAD_LINK.findall((root / name).read_bytes().decode("utf-8"))
         versions = {version for tag, asset, _ in links for version in (tag, asset)}
         if not links:
-            problems.append(f"{name}: 没有 Release 下载直链")
+            problems.append(t("version_bump.readmeNoLinks", name=name))
         elif len(versions) != 1 or not versions <= set(allowed):
-            problems.append(f"{name}: 下载直链版本 {'、'.join(sorted(versions))} 不是 "
-                            f"{' 或 '.join(allowed)}；用 release_tag.py --point-readme --apply 换到当前版本")
+            problems.append(t("version_bump.readmeStaleLinks", name=name,
+                              versions=sorted(versions),
+                              allowed=t("version_bump.or").join(allowed)))
     return problems
 
 
@@ -249,9 +258,9 @@ def plan_bump(root: Path, part: str = "auto") -> dict[str, object]:
     spec = release_range(root)
     subjects = subjects_in(root, spec)
     if not subjects:
-        raise VersionError(f"{spec} 里没有提交，没有可发布的内容")
+        raise VersionError(t("version_bump.noCommits", range=spec))
     if not runtime_inputs_changed(changed_in(root, spec)):
-        raise VersionError(f"{spec} 只碰了开发过程的文件，发布物与上一个标签相同")
+        raise VersionError(t("version_bump.devOnly", range=spec))
     chosen = bump_part_for(subjects, added_in(root, spec)) if part == "auto" else part
     current = read_version(root)
     return {

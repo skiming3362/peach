@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from peach import feed_followup, wants, web_wants  # noqa: E402
 from peach.web_contract import WebContract  # noqa: E402
 from peach.web_router import dispatch_api_get, dispatch_api_post  # noqa: E402
+from peach.user_messages import UserValueError
 from support.ledger import fresh_ledger  # noqa: E402
 
 
@@ -93,6 +94,23 @@ class MagnetLookupTests(unittest.TestCase):
             path.write_text(payload, encoding='utf-8')
             self.assertEqual(MagnetSearch(self.root, fetcher=fetcher).query('DEMO-001')['state'], 'ready')
         self.assertEqual(fetcher.call_count, 2)
+
+    def test_resources_saved_by_older_versions_read_back_with_english_ids(self):
+        from peach.wants_magnets import MagnetSearch
+        from unittest.mock import Mock
+        now = 1_800_000_000.0
+        fetcher = Mock(return_value={'items': []})
+        path = self.root / 'cache' / 'want-resources.json'
+        path.parent.mkdir()
+        legacy = [{**self.items[0], 'attributes': ['中字', '高清', '4K']},
+                  {**self.items[0], 'protocol': 'url', 'uri': 'https://example.test/a', 'source': 'JavDB 评论'}]
+        path.write_text(json.dumps({'version': 1, 'entries': [{'code': 'DEMO-001', 'saved': now - 60,
+                        'result': {'state': 'ready', 'items': legacy}}]}, ensure_ascii=False), encoding='utf-8')
+        items = MagnetSearch(self.root, fetcher=fetcher, wallclock=lambda: now).query(
+            'DEMO-001', released='2020-01-01')['items']
+        self.assertEqual(fetcher.call_count, 0)
+        self.assertEqual(items[0]['attributes'], ['chinese-subtitles', 'high-definition', '4K'])
+        self.assertEqual(items[1]['source'], 'javdb-comments')
 
     def test_expired_success_keeps_its_resources_and_uses_the_failure_cooldown(self):
         from peach.wants_magnets import MagnetSearch
@@ -171,7 +189,7 @@ class MagnetLookupTests(unittest.TestCase):
         from peach.wants_magnets import MagnetSearch
         from peach.sources import SourceFailure, FailureReason
         def refused(root, code):
-            raise SourceFailure(FailureReason.AUTH_REQUIRED, 'javdb 要求登录')
+            raise SourceFailure(FailureReason.AUTH_REQUIRED, 'errors.javdb.loginRequired')
         result = MagnetSearch(self.root, fetcher=refused).query('DEMO-001')
         self.assertEqual(result['state'], 'error')
         self.assertIn('登录', result['error'])
@@ -246,7 +264,7 @@ class WantWebFixture(unittest.TestCase):
     def _collect(self, provider, code):
         self.collected.append(code)
         if code in self.collect_misses:
-            raise ValueError("来源链上都没有这个番号的资料")
+            raise UserValueError("errors.feedFollowup.noMetadata", {"chain": "r18dev、javdb"})
         return ({"title": f"{code} 的标题", "studio": "示例厂牌", "release_date": "2026-09-20",
                  "performers": [{"name": "深田えいみ"}]}, "https://images.example.test/cover.jpg")
 
@@ -319,7 +337,7 @@ class WantListTests(WantWebFixture):
         self.post("/api/wants", {"action": "add", "code": "SSIS-951"})
         self.settle()
         item = self.get()["items"][0]
-        self.assertEqual(item["scrape_error"], "来源链上都没有这个番号的资料")
+        self.assertEqual(item["scrape_error"], "来源链 r18dev、javdb 上都没有这个番号的资料")
         self.assertEqual(self.contract.task_runs.query(task_key='want-scrape')[0].result_summary['incomplete'], 1)
         with self.contract.database.read_connection() as connection:
             self.assertEqual(web_wants.backlog(connection, self.contract.cover_root), [])
@@ -346,6 +364,77 @@ class WantListTests(WantWebFixture):
         self.assertEqual(self.post("/api/wants", {"action": "remove", "ids": [first]})["affected"], 1)
         self.assertEqual([(item["id"], item["phase"], item["search_count"]) for item in self.get()["items"]],
                          [(second, wants.SEARCHING, 0)])
+
+
+class ScheduledSearchTests(WantWebFixture):
+    """定时查资源：按到期挑条目，查到与否按浏览器添加的番号判据，逐条记账，来源连续失败就歇。"""
+
+    def wanted(self, *codes):
+        # 查询换成按番号回答的假查询；只在本类的用例里换，基类继承来的资源查询用例照常走真的。
+        self.results: dict[str, dict] = {}
+        factory = self.enterContext(patch('peach.wants_magnets.search_for'))
+        factory.return_value.query.side_effect = lambda code, refresh=False, released=None: self.results[code]
+        with self.contract.database.write_transaction() as connection:
+            return [wants.add_code(connection, code)['id'] for code in codes]
+
+    def answer(self, code, state='ready', names=(), **extra):
+        items = [{'protocol': 'magnet', 'uri': f'magnet:?xt=urn:btih:{index:040x}', 'name': name,
+                  'size': '4 GB', 'attributes': []} for index, name in enumerate(names, 1)]
+        self.results[code] = {'state': state, 'items': items, 'warnings': [], 'error': '',
+                              'checked_at': datetime.now(timezone.utc).isoformat(), **extra}
+
+    def run_round(self):
+        started = web_wants.start_search(self.contract)
+        thread = self.contract.want_search_job.thread
+        if thread is not None:
+            thread.join(10)
+            self.assertFalse(thread.is_alive())
+        return started
+
+    def outcomes(self):
+        with self.contract.database.read_connection() as connection:
+            return dict(connection.execute(
+                "SELECT code,last_search_outcome FROM want_item ORDER BY id").fetchall())
+
+    def test_a_round_records_found_none_and_source_errors(self):
+        self.wanted('DEMO-001', 'DEMO-002', 'DEMO-003')
+        self.answer('DEMO-001', names=['[HD] DEMO-001.mp4'])
+        self.answer('DEMO-002', names=['OTHER-999 完整版'])
+        self.answer('DEMO-003', state='error', error='来源连接失败')
+        self.assertIsNotNone(self.run_round())
+        self.assertEqual(self.outcomes(), {'DEMO-001': 'found', 'DEMO-002': 'none', 'DEMO-003': 'error'})
+        summary = self.contract.task_runs.query(task_key='want-search')[0].result_summary
+        self.assertEqual((summary['found'], summary['none'], summary['failed']), (1, 1, 1))
+        listed = {item['code']: item for item in self.get()['items']}
+        self.assertEqual(listed['DEMO-001']['last_search_outcome'], 'found')
+        self.assertFalse(self.get()['searching'])
+        self.assertIsNone(self.run_round())
+
+    def test_consecutive_source_failures_stop_the_round_and_pause_the_next(self):
+        self.wanted('DEMO-011', 'DEMO-012', 'DEMO-013', 'DEMO-014')
+        for code in ('DEMO-011', 'DEMO-012', 'DEMO-013', 'DEMO-014'):
+            self.answer(code, state='error')
+        self.run_round()
+        self.assertEqual(self.outcomes(), {'DEMO-011': 'error', 'DEMO-012': 'error', 'DEMO-013': 'error',
+                                           'DEMO-014': None})
+        self.assertIsNone(self.run_round())
+        self.contract.want_search_resume_at = 0
+        self.answer('DEMO-014')
+        self.run_round()
+        self.assertEqual(self.outcomes()['DEMO-014'], 'none')
+
+    def test_a_want_the_list_page_keeps_busy_is_left_for_the_next_round(self):
+        self.wanted('DEMO-021')
+        self.answer('DEMO-021', state='busy')
+        result = web_wants.search(self.contract, sleep=lambda seconds: None)
+        self.assertEqual((result['total'], result['none'], result['failed']), (1, 0, 0))
+        self.assertEqual(self.outcomes(), {'DEMO-021': None})
+
+    def test_the_scheduled_feed_tick_starts_the_search_even_without_due_sources(self):
+        from peach import web_feeds
+        with patch.object(web_wants, 'start_search') as start:
+            self.assertTrue(web_feeds.w_feed_check(self.contract, {'automatic': True})['idle'])
+            start.assert_called_once_with(self.contract)
 
 
 class FeedEntryTests(WantWebFixture):

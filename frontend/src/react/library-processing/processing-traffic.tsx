@@ -8,6 +8,7 @@ import { CollapseRegion } from '../components/collapse-region';
 import { useOverlayScrollbar } from '../components/overlay-scrollbar';
 import { SourceLabel } from '../components/source-label';
 import { SourceMark } from '../settings/section';
+import { codedText } from '../../core/server-text';
 import { t } from '../../i18n';
 
 const size = (value: number) => fmtSize(value).replace(/\s/g, '');
@@ -81,7 +82,7 @@ export function TrafficProgress({ traffic, initial = false, compact = false, det
         {traffic.sources.map(source => <li key={source.key} className="flex min-w-0 flex-col gap-1 border-b border-separator-border py-2 last:border-b-0">
           <div className="flex min-w-0 items-start justify-between gap-2">
             {source.root ? <SourceLabel source={source.location} label={source.label} />
-              : <span className="inline-flex min-w-0 items-center gap-1.5"><SourceMark mark="globe" />{source.label}</span>}
+              : <span className="inline-flex min-w-0 items-center gap-1.5"><SourceMark mark="globe" />{codedText(source, 'label')}</span>}
             <span className="shrink-0">{source.connection === 'system' ? t('manage:processingTraffic.connectionSystem') : source.connection === 'unknown' ? t('manage:processingTraffic.connectionUnknown') : source.metered ? t('manage:shared.proxy') : t('manage:processingTraffic.connectionDirect')}</span>
           </div>
           {source.workload?.video_files ? <p className="text-text-tertiary">{t('manage:processingTraffic.sourceVideoCount', { count: source.workload.video_files })} · {t('manage:processingTraffic.sourceJavCount', { count: source.workload.jav_files })}</p> : null}

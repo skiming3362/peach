@@ -23,9 +23,9 @@ import { momentText } from '../activity/tasks';
 import { useBackgroundJob } from '../background-job';
 import type { ScrapingProps } from '../bundle';
 import { IssueRow } from '../components/issue-row';
-import { LoadingDots } from '../components/loading-dots';
+import { TaskProgress } from '../components/task-progress';
+import { activityKind } from '../../activity-kinds';
 import { Note } from '../components/note';
-import { Progress } from '../components/progress';
 import { StatusLabel, type StatusTone } from '../components/status-label';
 import { ConnectionStatus } from '../components/connection-status';
 import { Page } from '../components/page';
@@ -44,6 +44,7 @@ import {
   SCRAPING_SETTINGS_URL, type AmaneBridge, type Check, type CheckAllJob, type CheckOutcome,
   type CoverJob, type ReportedCheck, type ScrapingData, type Source, type SourceReport,
 } from './scraping';
+import { codedText, jobText, partsLabel, serverLabel } from '../../core/server-text';
 import { interfaceLanguage, joinList, t } from '../../i18n';
 
 const NETWORKS = [['peach', t('manage:customSources.peachProxy')], ['direct', t('manage:sourceSettings.direct')]] as const;
@@ -159,7 +160,7 @@ function SourceCard({ source, toast }: { source: Source } & ScrapingProps) {
   const detailed = network === 'peach' || source.accepts_cookie || source.browser || !!problem || results.length > 0;
 
   return (
-    <Section title={source.label} onSubmit={submit} aside={
+    <Section title={codedText(source, 'label')} onSubmit={submit} aside={
       <span className="flex min-w-0 items-center gap-1">
         <SiteMark source={source.source} />
         {source.login ? <ExternalLink href={source.login}>{linkHost(source.login)}</ExternalLink> : null}
@@ -223,7 +224,7 @@ function SourceCard({ source, toast }: { source: Source } & ScrapingProps) {
         {problem ? <ErrorText>{problem}</ErrorText> : null}
         {results.map((result) => (
           <Note key={result.label} tone={result.ok ? 'success' : 'error'}>
-            <span className="flex flex-col items-start gap-1"><ConnectionStatus tone={result.ok ? 'success' : 'error'}>{result.ok ? t('manage:sourceSettings.reachable') : t('manage:sourceSettings.connectionFailed')}</ConnectionStatus><span>{checkText(result, source.label)}</span></span>
+            <span className="flex flex-col items-start gap-1"><ConnectionStatus tone={result.ok ? 'success' : 'error'}>{result.ok ? t('manage:sourceSettings.reachable') : t('manage:sourceSettings.connectionFailed')}</ConnectionStatus><span>{checkText(result, codedText(source, 'label'))}</span></span>
           </Note>
         ))}
       </Stack> : null}
@@ -249,8 +250,8 @@ const OUTCOME_ORDER: CheckOutcome[] = ['ok', 'auth', 'cooldown', 'http', 'networ
 
 /** 一项检查的名字：只查一跳的来源就是它本身。 */
 function targetName(report: SourceReport, check: ReportedCheck): string {
-  // i18n-exempt: 服务端给的检查项名，按原值判断
-  return check.label === '来源页面' ? report.label : t('manage:connectionCheck.hdImages', { source: report.label });
+  const source = codedText(report, 'label');
+  return check.target === 'cdn' ? t('manage:connectionCheck.hdImages', { source }) : source;
 }
 
 /** 全部来源一次检查完，与 `peach check-sources` 同一检查、同一报告口径。这一趟在后台跑，
@@ -283,7 +284,7 @@ function CheckAllCard({ toast }: ScrapingProps) {
     (a, b) => OUTCOME_ORDER.indexOf(a.check.outcome) - OUTCOME_ORDER.indexOf(b.check.outcome));
   const problem = start.error ? errorMessage(start.error)
     : taskQuery.error ? errorMessage(taskQuery.error)
-    : job?.status === 'failed' ? (job.error || t('manage:connectionCheck.notFinished')) : '';
+    : job?.status === 'failed' ? (jobText(job, 'error') || t('manage:connectionCheck.notFinished')) : '';
   const finished = job?.status === 'complete' && job.completed_at
     ? [momentText(new Date(job.completed_at * 1000).toISOString()),
        job.elapsed_s !== undefined ? t('manage:connectionCheck.elapsed', { seconds: job.elapsed_s.toFixed(1) }) : ''].filter(Boolean).join(' · ')
@@ -296,10 +297,8 @@ function CheckAllCard({ toast }: ScrapingProps) {
         {/* 说明写在一行里：拆行的 JSX 文本渲染时多出空格，改字工具就对不上源码。 */}
         <Help>{t('manage:connectionCheck.help')}</Help>
         {running
-          ? <div className="flex flex-col gap-2">
-              <Progress label={t('manage:connectionCheck.progress')} value={job?.checked ?? 0} max={job?.total ?? 0} />
-              <Help role="status">{t('manage:connectionCheck.checkedCount', { checked: job?.checked ?? 0, count: job?.total ?? 0 })}</Help>
-            </div>
+          ? <TaskProgress embedded kind="radar" value={job?.checked ?? 0} total={job?.total ?? 0}
+              label={t('manage:connectionCheck.checkedCount', { checked: job?.checked ?? 0, count: job?.total ?? 0 })} />
           : null}
         {problem ? <Note tone="error">{problem}</Note> : null}
         {checks.length
@@ -307,7 +306,7 @@ function CheckAllCard({ toast }: ScrapingProps) {
               {OUTCOME_ORDER.map((key) => {
                 const count = checks.filter(({ check }) => check.outcome === key).length;
                 return count ? <StatusLabel key={key} tone={OUTCOME_TONES[key]}>
-                  {checks.find(({ check }) => check.outcome === key)?.check.outcome_label} {count}
+                  {codedText(checks.find(({ check }) => check.outcome === key)?.check, 'outcome_label')} {count}
                 </StatusLabel> : null;
               })}
             </div>
@@ -317,9 +316,9 @@ function CheckAllCard({ toast }: ScrapingProps) {
               {problems.map(({ source, name, check }) => (
                 <IssueRow key={name} title={titled(source, name)}>
                   <span className="flex flex-wrap items-center gap-2">
-                    <StatusLabel tone={OUTCOME_TONES[check.outcome]}>{check.outcome_label}</StatusLabel>
+                    <StatusLabel tone={OUTCOME_TONES[check.outcome]}>{codedText(check, 'outcome_label')}</StatusLabel>
                     {check.message
-                      ? <span className="text-body-2-regular text-text-secondary">{check.message}</span>
+                      ? <span className="text-body-2-regular text-text-secondary">{codedText(check, 'message')}</span>
                       : null}
                   </span>
                 </IssueRow>
@@ -346,6 +345,12 @@ function CheckAllCard({ toast }: ScrapingProps) {
   );
 }
 
+/** 封面任务成功那一句。 */
+const coverResult = (job: CoverJob) => serverLabel(job.result_code ?? '', job.result ?? '', job.result_params);
+
+/** 封面任务失败那一句：由几段拼成的逐段取译文，缺一段译文就整句用服务端原文。 */
+const coverFailure = (job: CoverJob): string => partsLabel(job.error_parts, jobText(job, 'error'));
+
 /** 按番号补一张高清封面。这一趟在后台跑，页面上留状态。 */
 function CoverCard({ toast }: ScrapingProps) {
   const [code, setCode] = useState('');
@@ -354,7 +359,7 @@ function CoverCard({ toast }: ScrapingProps) {
     queryFn: ({ signal }) => fetchCoverJob(signal),
     start: () => apiSend<CoverJob>(SCRAPING_COVER_URL, { code }),
     onFinish: (state) => {
-      if (state.status === 'complete') toast(state.result || t('manage:hdCover.fetched'));
+      if (state.status === 'complete') toast(coverResult(state) || t('manage:hdCover.fetched'));
     },
   });
 
@@ -366,7 +371,7 @@ function CoverCard({ toast }: ScrapingProps) {
 
   const problem = start.error ? errorMessage(start.error)
     : taskQuery.error ? errorMessage(taskQuery.error)
-    : outcome?.status === 'failed' ? (outcome.error || t('manage:hdCover.notFound')) : '';
+    : outcome?.status === 'failed' ? (coverFailure(outcome) || t('manage:hdCover.notFound')) : '';
   return (
     <Section title={t('manage:hdCover.title')} onSubmit={submit}>
       <Stack>
@@ -382,10 +387,10 @@ function CoverCard({ toast }: ScrapingProps) {
         </div>
         {/* 这一趟要挨个问几家站点、还可能走代理，没有可数的总量，也不能编一个百分比出来。
             关掉页面它照样在跑，回来能接上，所以状态得留在页面上，而不是只让按钮转一下。 */}
-        {running ? <LoadingDots label={t('manage:hdCover.fetching')} /> : null}
+        {running ? <TaskProgress embedded kind={activityKind('scraping-cover')} label={t('manage:hdCover.fetching')} /> : null}
         {problem ? <Note tone="error">{problem}</Note> : null}
         {outcome?.status === 'complete'
-          ? <Note tone="success">{outcome.result || t('manage:hdCover.fetched')}</Note>
+          ? <Note tone="success">{coverResult(outcome) || t('manage:hdCover.fetched')}</Note>
           : null}
       </Stack>
     </Section>
@@ -403,11 +408,11 @@ function AmaneBridgeCard({ toast }: ScrapingProps) {
     jobOf: (card) => card.job,
     withJob: (card, started) => card && { ...card, job: started },
     onFinish: (state) => {
-      if (state.status === 'complete') toast(state.result || t('manage:amaneRuntime.rebuilt'));
+      if (state.status === 'complete') toast(codedText(state, 'result') || t('manage:amaneRuntime.rebuilt'));
     },
   });
   const check = useMutation({
-    mutationFn: () => apiSend<{ latest: string }>(AMANE_BRIDGE_CHECK_URL, {}),
+    mutationFn: () => apiSend<{ latest: string; latest_code?: string }>(AMANE_BRIDGE_CHECK_URL, {}),
   });
 
   const data = bridge.data;
@@ -420,27 +425,27 @@ function AmaneBridgeCard({ toast }: ScrapingProps) {
   const busy = running || rebuild.isPending || check.isPending;
   const problem = rebuild.error ? errorMessage(rebuild.error)
     : check.error ? errorMessage(check.error)
-    : outcome?.status === 'failed' ? (outcome.error || t('manage:amaneRuntime.rebuildNotFinished')) : '';
+    : outcome?.status === 'failed' ? (jobText(outcome, 'error') || t('manage:amaneRuntime.rebuildNotFinished')) : '';
   return (
     <Section id="amane" title="amane" aside={<ExternalLink href={data.repository} leadingIcon={GitHubMark}>{data.repository}</ExternalLink>}>
       <FactList>
         <Fact term={t('manage:amaneRuntime.installedVersion')}>{data.installed_version || t('manage:amaneRuntime.notInstalled')}</Fact>
-        <Fact term={t('manage:amaneRuntime.latestVersion')}>{check.data?.latest ?? t('manage:amaneRuntime.notChecked')}</Fact>
+        <Fact term={t('manage:amaneRuntime.latestVersion')}>{check.data ? codedText(check.data, 'latest') : t('manage:amaneRuntime.notChecked')}</Fact>
         <Fact term={t('manage:amaneRuntime.runtime')}>{data.installed ? t('manage:amaneRuntime.installed') : t('manage:amaneRuntime.notInstalled')}</Fact>
         <Fact term={t('manage:amaneRuntime.builtInSites')}>{t('manage:amaneRuntime.siteCount', { count: data.sites.length })}</Fact>
       </FactList>
       <Stack divided>
         {data.sites.length
           ? <Disclosure summary={t('manage:amaneRuntime.showSites')}>
-              <p className="text-body-2-regular text-text-secondary">{joinList(data.sites.map((site) => site.label))}</p>
+              <p className="text-body-2-regular text-text-secondary">{joinList(data.sites.map((site) => codedText(site, 'label')))}</p>
             </Disclosure>
           : null}
         {data.problem
           ? <Note tone="error">{data.problem}</Note>
           : <Help>{t('manage:amaneRuntime.help', { license: data.license, version: data.version })}</Help>}
-        {running ? <LoadingDots label={t('manage:amaneRuntime.rebuilding')} /> : null}
+        {running ? <TaskProgress embedded kind={activityKind('amane-bridge')} label={t('manage:amaneRuntime.rebuilding')} /> : null}
         {problem ? <Note tone="error">{problem}</Note> : null}
-        {outcome?.status === 'complete' ? <Note tone="success">{outcome.result || t('manage:amaneRuntime.rebuilt')}</Note> : null}
+        {outcome?.status === 'complete' ? <Note tone="success">{codedText(outcome, 'result') || t('manage:amaneRuntime.rebuilt')}</Note> : null}
       </Stack>
       <Footer>
         <Button variant="secondary" onClick={() => { if (!busy) check.mutate() }} {...busyProps(check.isPending)}>

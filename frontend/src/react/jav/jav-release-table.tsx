@@ -7,7 +7,7 @@ import { useJavSelection } from './jav-selection';
 import { Table, TableBody, TableCell, TableColumn, TableHeader, TableRow } from '@/components/base/table/table';
 import { ChevronSortDown } from '@/components/foundations/icons/chevrons';
 import { entityPath, fmtDur, leadingGraphemes } from '@peach/legacy/core';
-import { COVER_STATE_TITLE, logoUrl } from '@peach/card-art';
+import { COVER_STATE_TITLE, coverReason, logoUrl } from '@peach/card-art';
 import { relayoutCovers } from '../../card-art/framing';
 import { catalogListSkeletonCellHtml } from '../../catalog-content-skeleton';
 import { textLang } from '../../core/text-lang';
@@ -59,7 +59,7 @@ export function ReleaseTable({ items, waiting, filters, studios, javImage, readO
             <span data-list-picture="">{artwork
               ? <ArtSlot artwork={{ kind: 'cover', html: artwork }} relayout={root => relayoutCovers(root, 'small')} />
               // 缩略格只放得下状态字，原因放进悬停说明；当场取的键在卡片模式与分区顶上那条提示里。
-              : <span title={item.cover_reason || undefined}>{item.cover_state ? COVER_STATE_TITLE[item.cover_state] : t('catalog:shared.noCover')}</span>}</span>
+              : <span title={coverReason(item) || undefined}>{item.cover_state ? COVER_STATE_TITLE[item.cover_state] : t('catalog:shared.noCover')}</span>}</span>
           </button>
           <span data-list-text="">
             <button type="button" data-list-name="" title={`${item.code} · ${item.title || t('catalog:javDiscovery.titleNotFound')}`} aria-label={t('catalog:javDiscovery.viewDetails', { code: item.code })}

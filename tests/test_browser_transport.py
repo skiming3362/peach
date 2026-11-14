@@ -347,7 +347,7 @@ class BrowserTransportTests(unittest.TestCase):
         self.assertEqual(bounds, [{"windowState": "normal"}, {"left": 200, "top": 100, "width": 1000, "height": 800},
                                   {"windowState": "minimized"}], "先放回屏幕内，过了再收起")
         self.assertIn("Page.bringToFront", [method for method, _ in server.calls])
-        self.assertEqual(attention_seen[0], ["fc2ppv-db.com 的人机验证需要点一下，浏览器窗口已打开"])
+        self.assertEqual(attention_seen[0], ["fc2ppv-db.com verification needs a click; the browser window is open"])
         self.assertEqual(browser_transport.attention(), [], "过了就撤回提醒")
 
     def test_minimizing_the_offscreen_window_on_a_challenge_brings_it_on_screen(self):
@@ -386,7 +386,7 @@ class BrowserTransportTests(unittest.TestCase):
                           if method in ("Browser.setWindowBounds", "Browser.getWindowBounds")}, {7})
         self.assertFalse(any(method == "Network.deleteCookies" for method, _ in server.calls),
                          "用户已经在看，不再等 15 秒清 cookie")
-        self.assertEqual(attention_seen[0], ["javten.com 的人机验证需要点一下，浏览器窗口已打开"])
+        self.assertEqual(attention_seen[0], ["javten.com verification needs a click; the browser window is open"])
         self.assertEqual(browser_transport.attention(), [])
 
     def test_a_window_put_away_by_peach_is_not_taken_for_a_user_summons(self):
@@ -466,7 +466,7 @@ class BrowserTransportTests(unittest.TestCase):
         started = self.clock.now
         with self.assertRaises(ChallengeUnsolved) as caught:
             transport(request, 10, 4096)
-        self.assertIn("不再弹", str(caught.exception))
+        self.assertIn("not shown again", str(caught.exception))
         self.assertLessEqual(self.clock.now - started, 56, "不弹窗就只等清 cookie 那 15 秒加自动时限，不再多等点击那 120 秒")
         self.assertEqual(window_shows(server), 1, "弹过一次没点过去，这次不弹")
         self.assertEqual(browser_transport.attention(), [])

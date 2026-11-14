@@ -13,11 +13,12 @@ import { Note } from '../components/note';
 import { queryClient } from '../query';
 import {
   DISCONNECTED_TEXT, fetchLibraryProcessing, LIBRARY_PROCESSING_KEY, LIBRARY_PROCESSING_URL,
-  pollInterval, processingActive, type LibraryProcessingCommand, type LibraryProcessingData,
+  processingActive, type LibraryProcessingCommand, type LibraryProcessingData,
 } from './library-processing';
 import { ProcessingActions } from './processing-actions';
 import { confirmMeteredPreviews, startPreviews } from './metered-previews';
 import { busyProps } from '../settings/use-action';
+import { jobText } from '../../core/server-text';
 import { t } from '../../i18n';
 
 /** 缺图判据与卡面一致；没开流量保护的影片可抽帧，有番号的影片可补发行封面。 */
@@ -59,9 +60,9 @@ export function LibraryCompletionPrompt({ assetIds, meteredIds = [], onComplete,
 function Completion({ assetIds, meteredIds, onComplete, className }: {
   assetIds: number[]; meteredIds: number[]; onComplete?(): void; className: string;
 }) {
+  /* 只读缓存：这个键的轮询由壳里常驻的停靠栏一处驱动（`use-library-processing.ts`）。 */
   const job = useQuery({ queryKey: LIBRARY_PROCESSING_KEY,
-    queryFn: ({ signal }) => fetchLibraryProcessing(signal),
-    refetchInterval: query => pollInterval(query.state.data, true) });
+    queryFn: ({ signal }) => fetchLibraryProcessing(signal) });
   const [started, setStarted] = useState<string | null>(null);
   const [outcome, setOutcome] = useState('');
   const completed = useRef<string | null>(null);
@@ -89,7 +90,7 @@ function Completion({ assetIds, meteredIds, onComplete, className }: {
   // 运行时保留缺图数量；新范围等待当前任务结束，不隐式追加或替换。
   const busy = start.isPending || processingActive(state);
   const problem = start.error ? errorMessage(start.error) : job.error ? DISCONNECTED_TEXT
-    : started && state?.job_id === started && state.status === 'failed' ? state.error || t('manage:completionPrompt.failed') : '';
+    : started && state?.job_id === started && state.status === 'failed' ? jobText(state, 'error') || t('manage:completionPrompt.failed') : '';
   const later = processingActive(state) ? t('manage:completionPrompt.afterCurrentTask') : '';
   const total = new Set([...assetIds, ...meteredIds]).size;
   const metered = meteredIds.length;

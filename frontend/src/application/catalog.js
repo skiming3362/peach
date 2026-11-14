@@ -1,5 +1,6 @@
 import { initialCatalogFilters, resetCatalogFilters, homeCatalogState, homePath as pathForCatalog, onlineDefaultLoc as defaultLocations, resolveSort } from '../react/catalog-grid/catalog-state';
 import { CatalogController } from '../react/catalog-grid/catalog-controller';
+import { completeReveal } from '../react/components/server-path-dialog';
 import { nextRating, ratingStars } from '../react/components/rating-values';
 /* catalog 域控制器：本域状态与动作，启动由 Application 的生命周期统一安装。 */
 import { censorOn, preferencesState, refreshAll, replaceCatalogAddress, sidebarFacets, wireDrag } from './preferences.js';
@@ -15,6 +16,7 @@ import { buildManageBar, cardLayout, homeLayoutActive, javActive, layoutState, s
 import { selectionState, selectMany, setSelectMode, toggleSelection } from './selection.js';
 import { javDisplayName, javTitleHtml } from '../core/jav-title';
 import { tagLabel } from '../core/tags';
+import { PORTRAIT } from '../core/stored-values';
 import { entityDisplayName } from '../core/entity-names';
 import { loadStage, stageApi } from '../react/application-residents';
 import { currentBarsContext, entityState, openEntity, pushEntityPage, routeEntityPage, sortKeys } from './entity.js';
@@ -449,7 +451,7 @@ export function paintGridPage(page,propsFor,surface,options={}) {
 
 export function catalogGridLayout(){
   const home=homeLayoutActive();
-  return gridLayout({active:javActive()||home,home,portrait:state.orient==='竖屏'}); // i18n-exempt: 竖屏是地址参数与状态值
+  return gridLayout({active:javActive()||home,home,portrait:state.orient===PORTRAIT});
 }
 
 export function catalogSkeletonHtml(label=tr('shell:skeleton.loadingVideos')){
@@ -486,7 +488,7 @@ export function catalogGridProps(){
     excludeVertical:(home&&path!=='/wall'&&!state.q&&!state.orient&&state.browse!=='folders')||state.jav==='1',
     mix:home&&path!=='/wall'&&!trash&&state.browse!=='folders',
     /* JAV 模式不插竖屏带：主列表的 exclude_vertical 管不到它，它是独立请求、独立插入的。 */
-    shorts:home&&path!=='/wall'&&!javActive()&&state.orient!=='竖屏'&&!trash&&state.browse!=='folders', // i18n-exempt: 竖屏是地址参数与状态值
+    shorts:home&&path!=='/wall'&&!javActive()&&state.orient!==PORTRAIT&&!trash&&state.browse!=='folders',
     countRow:$('#count'),onCount:paintCatalogCount,onCountFailed:()=>paintCatalogFilter({count:false}),
     emptyHtml:({trash:inTrash,libraryEmpty})=>inTrash
       ?preferencesState.emptyState('trash',tr('shell:trash.emptyTitle'),tr('shell:trash.emptyHint'))
@@ -629,7 +631,7 @@ catalogState.junkQueueActions = {
     ?window.open('/photo?id='+it.id,'_blank','noopener'):openItem(it.id,true,null,anchor),
   /* 定位成功由 Toast 报，卡上状态行留空；失败把原因写回状态行。 */
   reveal:async it=>{
-    try{await api('/api/reveal',{method:'POST',body:JSON.stringify({id:it.id})});receiptsState.toast({text:tr('shell:sourceTools.revealed')});return ''}
+    try{const result=await api('/api/reveal',{method:'POST',body:JSON.stringify({id:it.id})});await completeReveal(result,()=>receiptsState.toast({text:tr('shell:sourceTools.revealed')}));return ''}
     catch(error){return entityState.sourceHint(error.message)}
   },
   operate:(it,operation)=>runJunkOperation(it,operation),

@@ -7,6 +7,7 @@ import { useEffect, useRef, useState } from 'react';
 
 import { apiGet, apiSend } from '../../api';
 import { CommandSteps, ErrorText, Help, Stack } from './section';
+import { TaskProgress } from '../components/task-progress';
 import { useAction } from './use-action';
 import { t } from '../../i18n';
 
@@ -52,7 +53,8 @@ export function useDockerUpdate(currentVersion: string) {
 
 export function DockerUpdateProgress({ job }: { job: DockerJob }) {
   if (job.state === 'updating') {
-    return <Help role="status">{t('settings:dockerUpdate.updating')}</Help>;
+    // 等 Watchtower 拉镜像、重建容器，再等服务回来：是在等外部，画 Clock。
+    return <TaskProgress embedded kind="clock" label={t('settings:dockerUpdate.updating')} />;
   }
   if (job.state === 'done') return <Help role="status">{t('settings:dockerUpdate.done', { version: job.version })}</Help>;
   if (job.state === 'timeout') {

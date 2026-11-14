@@ -19,7 +19,9 @@ import {
   fetchFollowSchedule, fetchSettings, fetchThumbnailJobs, schedulePollInterval, useRunSchedule,
   useSaveFollowSchedule, useSaveSettings, useSaveThumbnailMode, type FollowScheduleStatus,
 } from '../settings-panel/settings-data';
-import { ErrorText, Help, Rows, Section, Stack, TaskCenterLink } from './section';
+import { ErrorText, Rows, Section, Stack, TaskCenterLink } from './section';
+import { TaskProgress } from '../components/task-progress';
+import { activityKind } from '../../activity-kinds';
 import { busyProps } from './use-action';
 import { ProcessingMode } from '../library-processing/processing-effort';
 import { t } from '../../i18n';
@@ -65,7 +67,8 @@ export function VideoThumbnailControls({ epoch = 0, disabled = false }: { epoch?
       </Rows>
       {save.isPending || data?.status === 'running'
         ? <Stack divided>
-            <Help role="status">{save.isPending ? t('settings:shared.saving') : t('settings:timelineThumbnails.generating')}</Help>
+            {save.isPending ? <TaskProgress embedded kind="gather" label={t('settings:shared.saving')} />
+              : <TaskProgress embedded kind={activityKind('timeline-thumbnails')} label={t('settings:timelineThumbnails.generating')} />}
             {save.isPending ? null : <TaskCenterLink />}
           </Stack>
         : null}
@@ -158,7 +161,8 @@ function FollowScheduleRow() {
       </SettingsRow>
       {invalid ? <Stack><ErrorText>{t('settings:followSchedule.invalidInterval')}</ErrorText></Stack> : null}
       {save.isPending || data?.running
-        ? <Stack><Help role="status">{save.isPending ? t('settings:shared.saving') : t('settings:followSchedule.checking')}</Help></Stack> : null}
+        ? <Stack>{save.isPending ? <TaskProgress embedded kind="gather" label={t('settings:shared.saving')} />
+          : <TaskProgress embedded kind={activityKind('follow-check')} label={t('settings:followSchedule.checking')} />}</Stack> : null}
       <ScheduleFailure kind="follow" status={data} title={t('settings:followSchedule.lastCheckFailed')} />
       {error ? <Stack><ErrorText>{errorMessage(error)}</ErrorText></Stack> : null}
     </>
@@ -184,7 +188,7 @@ function FeedScheduleRow() {
       <SettingsRow label={t('settings:followFetch.feedSchedule')}>
         <span id="feedScheduleSetting">{!data.available ? t('settings:followSchedule.primaryOnly') : data.enabled ? interval : t('settings:followSchedule.feedOff')}</span>
       </SettingsRow>
-      {data.running ? <Stack><Help role="status">{t('settings:followSchedule.fetchingFeeds')}</Help></Stack> : null}
+      {data.running ? <Stack><TaskProgress embedded kind={activityKind('feed-check')} label={t('settings:followSchedule.fetchingFeeds')} /></Stack> : null}
       <ScheduleFailure kind="feed" status={data} title={t('settings:followSchedule.lastFetchFailed')} />
     </>
   );

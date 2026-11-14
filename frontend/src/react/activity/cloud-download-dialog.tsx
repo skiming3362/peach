@@ -15,7 +15,7 @@ import { ModalFrame } from '../components/modal-frame';
 import { Note } from '../components/note';
 import { ErrorText, FieldLabel, Help } from '../settings/section';
 import { busyProps, useAction } from '../settings/use-action';
-import { DOWNLOADS_KEY, DOWNLOADS_URL, downloadPollInterval, failureText } from './downloads-panel';
+import { DOWNLOADS_KEY, DOWNLOADS_URL, downloadsInterval, failureText } from './downloads-panel';
 import { ResourceSearch } from './resource-search';
 import { sameWorkCode } from './work-code';
 import { SourceLabel } from '../components/source-label';
@@ -53,7 +53,7 @@ function Body({ prefill, close, receipt, provider }: {
   const query = useQuery({
     queryKey: DOWNLOADS_KEY,
     queryFn: ({ signal }) => apiGet<DownloadsSnapshot>(`${DOWNLOADS_URL}?limit=50`, signal),
-    refetchInterval: (state) => downloadPollInterval(state.state.data),
+    refetchInterval: downloadsInterval,
   });
   const data = query.data;
   const header = (

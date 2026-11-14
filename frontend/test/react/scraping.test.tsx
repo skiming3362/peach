@@ -195,8 +195,8 @@ it('保存失败时原因留在卡内，列表和刚填的内容都不动', asyn
 
 it('连接结果按来源名称与这一跳查的是什么说成一句话', async () => {
   const results: Check[] = [
-    { label: '来源页面', ok: true, width: 800, height: 538 },
-    { label: '高清图片 CDN', ok: false, status: 403, message: '需要登录' },
+    { target: 'page', label: '来源页面', ok: true, width: 800, height: 538 },
+    { target: 'cdn', label: '高清图片 CDN', ok: false, status: 403, message: '需要登录' },
   ];
   const { host } = await open({
     ...quiet(),

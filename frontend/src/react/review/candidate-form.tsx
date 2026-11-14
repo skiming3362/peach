@@ -12,6 +12,7 @@ import { Button } from '@/components/base/buttons/button';
 import { InputBase, TextField } from '@/components/base/input/input';
 import { CollapseChevron, CollapseRegion } from '../components/collapse-region';
 import { errorMessage } from '../../api';
+import { codedText, serverLabelList } from '../../core/server-text';
 import type { ReviewCandidate, ReviewRow } from './review';
 import { pendingGenres, recordGenre, reloadReview } from './review';
 import { ComparisonText } from './comparison-text';
@@ -61,13 +62,13 @@ function CandidateEvidence({ candidate, row }: { candidate: ReviewCandidate; row
                 {EVIDENCE_LABELS[field] || field}
               </dt>
               <dd className="min-w-0 text-body-2-regular break-words text-text-primary">
-                <ComparisonText value={item.display_value || ''}
+                <ComparisonText value={codedText(item, 'display_value')}
                   reference={field === row.field && row.current_value
                     ? row.current_value
-                    : row.candidates?.find(peer => peer.candidate_key !== candidate.candidate_key
-                        && peer.catalog_evidence?.[field]?.display_value)?.catalog_evidence?.[field]?.display_value} />
+                    : codedText(row.candidates?.find(peer => peer.candidate_key !== candidate.candidate_key
+                        && peer.catalog_evidence?.[field]?.display_value)?.catalog_evidence?.[field], 'display_value')} />
               </dd>
-              {(item.warnings || []).map((warning) => (
+              {serverLabelList(item.warnings, item.warning_codes, item.warning_params).map((warning) => (
                 <small key={warning} className="w-full text-caption-1-regular text-status-yellow-text">
                   {warning}
                 </small>
@@ -90,7 +91,7 @@ function CandidateValue({ candidate, reference }: { candidate: ReviewCandidate; 
     <span className="text-body-regular text-text-primary">
       <ComparisonText value={candidate.display_value || ''} reference={reference} />
     </span>
-    {(candidate.warnings || []).map(warning => (
+    {serverLabelList(candidate.warnings, candidate.warning_codes, candidate.warning_params).map(warning => (
       <span key={warning} className="text-body-2-regular text-status-yellow-text">{warning}</span>
     ))}
   </span>;

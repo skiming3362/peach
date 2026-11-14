@@ -46,6 +46,7 @@ import { EmptyState } from '../components/empty-state';
 import { clickedBlank } from '../components/row-click';
 import { Note } from '../components/note';
 import { TaskProgress } from '../components/task-progress';
+import { activityKind } from '../../activity-kinds';
 import { SelectionDock } from '../components/selection-dock';
 import { busyProps } from '../settings/use-action';
 import {
@@ -58,6 +59,8 @@ import {
   type TableRow as SourceTableRow,
 } from './follow-manage';
 import { AuthorAvatar, ErrorLine, SourceIcon, SourceLink, StatusBadge } from './source-view';
+import { codedText, jobText } from '../../core/server-text';
+import { FOLLOW_CHECK_TASK } from '../../running-tasks';
 import { joinList, t } from '../../i18n';
 
 const sourceTableFeatures = tableFeatures({
@@ -164,7 +167,7 @@ function SourceRow(
           <span aria-hidden className="w-4 shrink-0" />
           <span className="flex min-w-0 grow gap-1.5">
             <span aria-hidden className="w-(--icon-inline) shrink-0 text-body-medium" />
-            <span className="min-w-0 grow"><ErrorLine text={source.last_error} /></span>
+            <span className="min-w-0 grow"><ErrorLine text={codedText(source, 'last_error')} /></span>
           </span>
         </span>
       ) : null}
@@ -269,12 +272,13 @@ export function SourceList(props: SourceListProps) {
 
   const { job, running, outcome, start: check } = useBackgroundJob<CheckJob, number[]>({
     queryKey: FOLLOW_CHECK_KEY,
+    taskKey: FOLLOW_CHECK_TASK,
     queryFn: ({ signal }) => fetchCheckJob(signal),
     start: (ids) => startCheck(ids),
     onError: (cause) => setProblem(errorMessage(cause)),
     onFinish: (state) => {
       void reloadFollowManage();
-      toast(state.status === 'failed' ? (state.error || t('follow:followCheck.checkFailed')) : checkReceipt(state));
+      toast(state.status === 'failed' ? (jobText(state, 'error') || t('follow:followCheck.checkFailed')) : checkReceipt(state));
     },
   });
 
@@ -403,7 +407,7 @@ export function SourceList(props: SourceListProps) {
         cell: (context) => (
           <span className="flex min-w-0 flex-col gap-0.5">
             <SourceLink source={context.row.original.source} />
-            {context.row.original.source.last_error ? <ErrorLine text={context.row.original.source.last_error} /> : null}
+            {context.row.original.source.last_error ? <ErrorLine text={codedText(context.row.original.source, 'last_error')} /> : null}
           </span>
         ),
       }),
@@ -575,7 +579,7 @@ export function SourceList(props: SourceListProps) {
 
       {/* 这一趟在后台跑，关掉页面还在继续，所以状态留在页面上而不是只让按钮转一下。 */}
       <div aria-live="polite" className="flex flex-col gap-3 empty:hidden">
-        {running ? <TaskProgress embedded label={job?.message || (job?.total
+        {running ? <TaskProgress embedded kind={job?.older ? activityKind('feed-scrape') : activityKind('follow-check')} label={jobText(job) || (job?.total
           ? t(job.older ? 'follow:sourceList.backfillProgress' : 'follow:sourceList.checkProgress', { checked: job.checked || 0, count: job.total })
           : t('follow:sourceList.preparingCheck'))} value={job?.checked} total={job?.total} /> : null}
         {problem ? <Note tone="error" title={t('follow:shared.actionFailed')}>{problem}</Note> : null}

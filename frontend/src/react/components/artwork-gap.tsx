@@ -13,7 +13,7 @@ import { apiSend } from '../../api';
 import { patchCatalogItems } from '../catalog-grid/catalog-grid';
 import type { MediaItem } from '../catalog-grid/types';
 import {
-  fetchLibraryProcessing, LIBRARY_PROCESSING_KEY, pollInterval, processingActive,
+  fetchLibraryProcessing, LIBRARY_PROCESSING_KEY, processingActive,
 } from '../library-processing/library-processing';
 import { confirmMeteredPreviews, startPreviews } from '../library-processing/metered-previews';
 import { queryClient } from '../query';
@@ -47,12 +47,13 @@ export function missingArtwork(item: GapItem, frameOnly: boolean): ArtworkGap {
   return none('pending', t('shell:artworkGap.framesPending'), 'previews');
 }
 
-/** `/poster` 取不到时服务端交出的那一步（`PreviewUnavailable` 的原文）。 */
+/** `/poster` 取不到时服务端交出的那一步（`PreviewUnavailable` 的 `reason_code`）。 */
+const SNAPSHOT_MISSING = 'errors.previews.snapshotUnavailable';
 const POSTER_REASONS: Record<string, string> = {
-  'snapshot unavailable': t('shell:artworkGap.frameFilesMissing'),
-  'ffmpeg unavailable': t('shell:artworkGap.ffmpegMissing'),
-  'ffmpeg generation failed': t('shell:artworkGap.previewFailed'),
-  'snapshot changed during preview generation': t('shell:artworkGap.framesUpdating'),
+  [SNAPSHOT_MISSING]: t('shell:artworkGap.frameFilesMissing'),
+  'errors.previews.ffmpegUnavailable': t('shell:artworkGap.ffmpegMissing'),
+  'errors.previews.ffmpegFailed': t('shell:artworkGap.previewFailed'),
+  'errors.previews.snapshotChanged': t('shell:artworkGap.framesUpdating'),
 };
 
 /** 有图但取失败了：同源的图再取一次，按状态码和服务端给的原因说话；别人站点上的图读不到原因。 */
@@ -66,9 +67,9 @@ export async function failedArtwork(src: string, kind: string): Promise<ArtworkG
     const response = await fetch(url, { cache: 'no-store' });
     if (response.ok) return gap('interrupted', t('shell:artworkGap.loadInterrupted'), 'retry');
     if (url.pathname === '/cover') return gap('cover-file', t('shell:artworkGap.coverFileMissing'), 'cover');
-    const body = await response.json().catch(() => ({})) as { reason?: string };
-    const reason = POSTER_REASONS[String(body.reason || '')];
-    if (body.reason === 'snapshot unavailable') return gap('snapshot', reason!, 'previews');
+    const body = await response.json().catch(() => ({})) as { reason_code?: string };
+    const reason = POSTER_REASONS[String(body.reason_code || '')];
+    if (body.reason_code === SNAPSHOT_MISSING) return gap('snapshot', reason!, 'previews');
     return gap('server', reason || t('shell:artworkGap.serverStatus', { status: response.status }), 'retry');
   } catch {
     return gap('offline', t('shell:artworkGap.serviceUnreachable'), 'retry');
@@ -119,7 +120,8 @@ function PreviewsButton({ id, metered, onDone, onProblem }: {
 }) {
   const [started, setStarted] = useState<string | null>(null);
   const job = useQuery({ queryKey: LIBRARY_PROCESSING_KEY, queryFn: ({ signal }) => fetchLibraryProcessing(signal),
-    staleTime: 15_000, refetchInterval: query => started ? pollInterval(query.state.data, true) : false }, queryClient);
+    /* 只读缓存：这一趟的进度由壳里常驻的停靠栏一处轮询，回来的快照换进同一个键。 */
+    staleTime: 15_000 }, queryClient);
   const action = useAction();
   const state = job.data;
   const mine = !!started && state?.job_id === started;

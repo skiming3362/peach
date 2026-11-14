@@ -24,7 +24,7 @@ import { apiGet, apiSend, errorMessage } from '../../api';
 import type {
   ConfigurationPanel, DownloadCheckReport, DownloadConfig, DownloadSaveResult, DownloadSettingsState, PikPakLoginResult,
 } from '../bundle';
-import { LoadingDots } from '../components/loading-dots';
+import { ActivityStatus } from '../components/activity-motion';
 import { Note } from '../components/note';
 import { SourceLabel, providerIcon } from '../components/source-label';
 import { groupRoot } from './configuration-panel';
@@ -34,6 +34,8 @@ import {
 import { busyProps, useAction } from './use-action';
 import { JavBrowserSettings } from './jav-browser-settings';
 import { CLOUD_LOCATIONS } from '../../core/media-sources';
+import { jobText, serverLabel } from '../../core/server-text';
+import { pollUntil } from '../../polling';
 import { t } from '../../i18n';
 
 export const DOWNLOADS_URL = '/api/configuration/downloads';
@@ -43,7 +45,20 @@ const LOGIN_URL = '/api/configuration/downloads/pikpak/login';
 const LOGOUT_URL = '/api/configuration/downloads/pikpak/logout';
 const BROWSER_URL = '/api/configuration/downloads/pikpak/browser-login';
 const POLL_MS = 2000;
+/** 浏览器登录最多等这么久，过了由用户重新打开。 */
+const BROWSER_LOGIN_LIMIT_MS = 15 * 60_000;
 const PikPakIcon = providerIcon('pikpak');
+
+/** 设置块与检查报告里的问题：`problems` 是服务端按 zh-CN 渲染的原句，`problem_codes` 与之一一对应，
+ *  有译文用译文；缺 code 的旧原句照原文显示。 */
+const problemTexts = (body: Pick<DownloadSettingsState, 'problems' | 'problem_codes'>): string[] =>
+  (body.problems ?? []).map((problem, index) => {
+    const coded = body.problem_codes?.[index];
+    return coded?.code ? serverLabel(coded.code, problem, coded.params) : problem;
+  });
+/** 检查报告里缺的离线权限，`missing_codes` 与 `missing` 一一对应。 */
+const missingTexts = (report: DownloadCheckReport): string[] =>
+  report.missing.map((label, index) => serverLabel(report.missing_codes?.[index] ?? '', label));
 
 /** 「下载渠道」分组：CloudDrive2 与 PikPak 账号。 */
 export function DownloadGroup({ initial, receipt, panel, issues }: {
@@ -194,7 +209,7 @@ function DownloadForm({ state, settle, receipt, pikpakAccount }: CardProps & { p
 
   return (
     <Section guide="download" title={t('settings:cloudDownload.title')} onSubmit={submit}>
-      {state.problems?.length ? <Stack><Note tone="error" title={t('settings:cloudDownload.needsAttention')}>{state.problems.join('\n')}</Note></Stack> : null}
+      {state.problems?.length ? <Stack><Note tone="error" title={t('settings:cloudDownload.needsAttention')}>{problemTexts(state).join('\n')}</Note></Stack> : null}
       <Stack>
         <Input label={t('settings:cloudDownload.cloudDriveUrl')} placeholder={t('settings:cloudDownload.addressPlaceholder')} autoComplete="off" maxLength={200}
           value={config.clouddrive_address} isDisabled={!state.available}
@@ -226,7 +241,7 @@ function DownloadForm({ state, settle, receipt, pikpakAccount }: CardProps & { p
           hint={t('settings:cloudDownload.waitHint', { max: state.max_wait_hours })}
           value={hours} isDisabled={!state.available} onChange={setHours} />
       </Stack>
-      {action.busy === 'auto' ? <Stack divided><LoadingDots label={t('settings:cloudDownload.checking')} /></Stack> : null}
+      {action.busy === 'auto' ? <Stack divided><ActivityStatus kind="radar" label={t('settings:cloudDownload.checking')} /></Stack> : null}
       {report ? (
         <CheckReport report={report} detected={detected} suggested={suggested}
           create={state.available ? create : undefined} creating={action.busy === 'folder'} />
@@ -286,7 +301,7 @@ function CheckReport({ report, detected, suggested, create, creating }: {
         {report.permissions.length ? (
           <Fact term={t('settings:cloudDownload.offlinePermissions')}>
             {report.missing.length
-              ? report.missing.map(permission => <Chip key={permission} variant="caption" color="yellow">{t('settings:cloudDownload.missingPermission', { permission })}</Chip>)
+              ? missingTexts(report).map(permission => <Chip key={permission} variant="caption" color="yellow">{t('settings:cloudDownload.missingPermission', { permission })}</Chip>)
               : <Chip variant="caption" color="lime">{t('settings:cloudDownload.permissionsComplete')}</Chip>}
           </Fact>
         ) : null}
@@ -297,7 +312,7 @@ function CheckReport({ report, detected, suggested, create, creating }: {
           <Fact term={<SourceLabel source="115" label={t('settings:cloudDownload.quota115')} />}>{t('settings:cloudDownload.quotaLeft', { count: report.quota.left, total: report.quota.total })}</Fact>
         ) : null}
       </FactList> : null}
-      {report.problems.map((problem) => <ErrorText key={problem}>{problem}</ErrorText>)}
+      {problemTexts(report).map((problem) => <ErrorText key={problem}>{problem}</ErrorText>)}
     </Stack>
   );
 }
@@ -320,26 +335,22 @@ function PikPakAccount({ state, settle, receipt, username, setUsername }: CardPr
   const browser = state.pikpak_browser;
   const waiting = browser.state === 'waiting';
 
+  /* 等浏览器里那次登录：两秒读一次，读失败退避，页面不可见时暂停，等满上限就停。 */
   useEffect(() => {
     if (!waiting) return;
     const controller = new AbortController();
-    let timer: ReturnType<typeof setTimeout>;
-    const poll = async () => {
-      try {
-        const next = await apiGet<DownloadSettingsState>(BROWSER_URL, controller.signal);
-        if (controller.signal.aborted) return;
+    void pollUntil({
+      signal: controller.signal, everyMs: POLL_MS, limitMs: BROWSER_LOGIN_LIMIT_MS,
+      read: (signal) => apiGet<DownloadSettingsState>(BROWSER_URL, signal),
+      apply: (next) => {
         settle(next);
         if (next.pikpak_browser.state === 'done') receipt(t('settings:pikpakAccount.signedInReceipt'));
-        else if (next.pikpak_browser.state !== 'waiting') setOutcome(next.pikpak_browser.message);
-        if (next.pikpak_browser.state !== 'waiting') return;
-      } catch (cause) {
-        if (controller.signal.aborted) return;
-        setFailure(errorMessage(cause));
-      }
-      timer = setTimeout(poll, POLL_MS);
-    };
-    timer = setTimeout(poll, POLL_MS);
-    return () => { controller.abort(); clearTimeout(timer); };
+        else if (next.pikpak_browser.state !== 'waiting') setOutcome(jobText(next.pikpak_browser));
+      },
+      done: (next) => next.pikpak_browser.state !== 'waiting',
+      failed: (cause) => setFailure(errorMessage(cause)),
+    });
+    return () => controller.abort();
   }, [waiting]);
 
   const openBrowser = () => {
@@ -350,7 +361,7 @@ function PikPakAccount({ state, settle, receipt, username, setUsername }: CardPr
 
   const cancelBrowser = () => {
     void action.run('cancel', (signal) => apiSend<DownloadSettingsState>(`${BROWSER_URL}/cancel`, {}, 'POST', signal),
-      (next) => { settle(next); setFailure(''); setOutcome(next.pikpak_browser.message); },
+      (next) => { settle(next); setFailure(''); setOutcome(jobText(next.pikpak_browser)); },
       (cause) => setFailure(errorMessage(cause)));
   };
 
@@ -421,7 +432,7 @@ function PikPakAccount({ state, settle, receipt, username, setUsername }: CardPr
       )}
       {failure || action.error ? <Stack divided><ErrorText>{failure || action.error}</ErrorText></Stack> : null}
       <Footer status={!account.logged_in && waiting
-        ? <LoadingDots label={browser.message || t('settings:pikpakAccount.waitingBrowser')} /> : null}>
+        ? <ActivityStatus kind="clock" label={jobText(browser) || t('settings:pikpakAccount.waitingBrowser')} /> : null}>
         {account.logged_in ? (
           <Button variant="secondary" onClick={logout} disabled={!state.available} {...busyProps(action.busy === 'logout')}>{t('settings:shared.signOut')}</Button>
         ) : <>{!browser.available ? null : waiting ? (

@@ -23,12 +23,19 @@ FAILURE_PAUSE = 600.0
 TIMEOUT = 5.0
 
 
+#: 可能是分段发售的商品号：整片商品号后多一个尾字母（`sora00613a`）；特典版的 `v` 另有规则，不算。
+_PART_CID = re.compile(r"((?:h_\d+|\d+)?[a-z]+\d+)[a-uw-z]")
+
+
 def bonus_cid(cid: str) -> bool:
     return bool(_BONUS_CID.fullmatch(str(cid or "").lower()))
 
 
 class EditionProbe:
-    """问 DMM 通常版商品号有没有对应的特典版；任何失败都按「没有」答，不影响识别。"""
+    """问 DMM 某个商品号在不在：通常版有没有对应的特典版，分段商品号有没有整片。
+
+    任何失败都按「没有」答：识别照旧，只是少一个按钮或保留尾字母。
+    """
 
     def __init__(self, secrets_root: Path, *, transport_factory=None, clock=time.monotonic):
         self.secrets_root = Path(secrets_root)
@@ -39,9 +46,20 @@ class EditionProbe:
         self.paused_until = 0.0
 
     def __call__(self, cid: str) -> bool:
+        """通常版商品号有没有对应的特典版。"""
         cid = str(cid or "").lower()
-        if not _REGULAR_CID.fullmatch(cid):
-            return False
+        return bool(_REGULAR_CID.fullmatch(cid)) and self._exists(cid + "v")
+
+    def whole(self, cid: str) -> str:
+        """分段发售的商品号对应的整片商品号；DMM 上整片不在售或问不到时为空。
+
+        `sora00613a`、`sora00613b` 是整片 `sora00613` 的分段，资源按整片收录；`1dandy00851c` 没有整片，
+        尾字母是另一部作品的身份，保留。
+        """
+        matched = _PART_CID.fullmatch(str(cid or "").lower())
+        return matched[1] if matched and self._exists(matched[1]) else ""
+
+    def _exists(self, cid: str) -> bool:
         with self.lock:
             if cid in self.answers:
                 self.answers.move_to_end(cid)
@@ -49,8 +67,8 @@ class EditionProbe:
             if self.clock() < self.paused_until:
                 return False
         try:
-            exists = self._ask(cid + "v")
-        except Exception:  # noqa: BLE001 - 探测只决定多不多一个按钮，失败一律按没有特典版处理。
+            exists = self._ask(cid)
+        except Exception:  # noqa: BLE001 - 探测只决定按钮与尾字母，失败一律按不在处理。
             with self.lock:
                 self.paused_until = self.clock() + FAILURE_PAUSE
             return False

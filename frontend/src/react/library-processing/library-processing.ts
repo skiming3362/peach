@@ -4,9 +4,11 @@
  * 轮询也由 Query 合成一份，进度、失败与完成状态由服务端统一提供。
  * 端点在 `frontend/src` 里只在这里声明一次（`tests/test_frontend_build.py` 盯着）。 */
 import { apiGet } from '../../api';
+import { withBackoff } from '../../polling';
 import { elapsedText, progressText } from '../activity/tasks';
 import { queryClient } from '../query';
 import { joinList, quoted, t } from '../../i18n';
+import { codedText, serverLabel, stageText } from '../../core/server-text';
 
 export const LIBRARY_PROCESSING_URL = '/api/library-processing';
 
@@ -19,6 +21,9 @@ export interface LibraryProcessingIssue {
   title?: string;
   path?: string;
   message: string;
+  /** `message` 的 code 与参数；有译文时显示译文，没有 code 的（异常原文、文件名）照原文。 */
+  message_code?: string;
+  message_params?: Record<string, unknown>;
   /** `paused` 是来源限流没轮到这一项，等来源放开再跑就有；`error` 是它自己出的事。 */
   severity?: 'info' | 'error' | 'paused';
 }
@@ -41,11 +46,14 @@ export interface LibraryProcessingData {
   eta_seconds_max?: number | null;
   eta_kind?: 'historical' | 'measured' | 'estimating';
   eta_scope?: string;
+  eta_scope_code?: string;
   eta_initial?: boolean;
   job_id?: string;
   stage?: string;
+  stage_code?: string;
   requested_stage?: string;
-  steps?: { id: string; label: string; status: 'pending' | 'current' | 'complete' }[];
+  /** `label` 是 zh-CN 原文，`label_code` 有译文时显示译文。 */
+  steps?: { id: string; label: string; label_code?: string; status: 'pending' | 'current' | 'complete' }[];
   checked?: number;
   total?: number;
   scanned?: number;
@@ -61,6 +69,9 @@ export interface LibraryProcessingData {
   performer_profile_conflicts?: number;
   performer_profile_failed?: number;
   error?: string;
+  /** `error` 的 code 与参数；有译文时显示译文。 */
+  error_code?: string;
+  error_params?: Record<string, unknown>;
   issue_count?: number;
   /** `issue_count` 里卡在来源限流上的那些，等来源放开再跑一次就有。 */
   paused_count?: number;
@@ -186,7 +197,7 @@ export function remainingTime(state: LibraryProcessingData): string {
   const span = start === end ? `${end}` : `${start}–${end}`;
   const rough = state.eta_initial || state.eta_kind !== 'measured' ? t('manage:scanFetch.roughEstimate') : '';
   const key = unit === 86400 ? 'manage:scanFetch.etaDays' : unit === 3600 ? 'manage:scanFetch.etaHours' : 'manage:scanFetch.etaMinutes';
-  return t(key, { count: end, span, rough, scope: state.eta_scope ? ` · ${state.eta_scope}` : '' });
+  return t(key, { count: end, span, rough, scope: state.eta_scope ? ` · ${serverLabel(state.eta_scope_code ?? '', state.eta_scope)}` : '' });
 }
 
 export const fetchLibraryProcessing = (signal?: AbortSignal) =>
@@ -200,10 +211,11 @@ export async function prefetchLibraryProcessing(signal: AbortSignal): Promise<vo
   });
 }
 
-/** 在跑的时候两秒问一次，和别的后台任务同一个节律。 */
+/** 在跑的时候两秒问一次，和别的后台任务同一个节律。闲着不问：后台自己起的那一趟由全站那一处
+ *  读到的 `running_tasks` 带来（`LIBRARY_PROCESSING_TASK`），停靠栏据此重取一次再接上。 */
 export const RUNNING_POLL_MS = 2000;
-/** 闲着时也接着问：任务由后台自己起，两个读者都要认出「现在跑起来了」。 */
-export const IDLE_POLL_MS = 10_000;
+/** 任务中心登记这一种任务用的 `task_key`。 */
+export const LIBRARY_PROCESSING_TASK = 'library-processing';
 
 /** 读失败时页面上留的那句话。上一份数据不撤，下一轮轮询自己会接上。 */
 export const DISCONNECTED_TEXT = t('manage:scanFetch.disconnected');
@@ -231,12 +243,9 @@ export function busyText(state: LibraryProcessingData): string {
   return origin ? t('manage:scanFetch.busyOrigin', { origin }) : t('manage:scanFetch.busy');
 }
 
-export function pollInterval(
-  data: LibraryProcessingData | undefined, watching: boolean,
-): number | false {
-  if (processingActive(data)) return RUNNING_POLL_MS;
-  return watching ? IDLE_POLL_MS : false;
-}
+/** 同一个键只由停靠栏一处驱动轮询，卡片与补全提示只读缓存。在跑两秒一次，失败退避，闲着不问。 */
+export const pollInterval = withBackoff<LibraryProcessingData>((data) =>
+  (processingActive(data) ? RUNNING_POLL_MS : false));
 
 const ACTION_LABELS: Record<string, string> = {
   scanning_files: t('manage:scanFetch.actionScanning'),
@@ -267,7 +276,7 @@ export function notesLine(notes: Record<string, number>): string {
 export function currentLine(state: LibraryProcessingData): string {
   if (state.status === 'paused') return t('manage:taskStatus.paused');
   if (state.status === 'pausing') return t('manage:taskStatus.pausing');
-  const action = ACTION_LABELS[state.current_action || ''] || state.stage || t('manage:scanFetch.processing');
+  const action = ACTION_LABELS[state.current_action || ''] || stageText(state) || t('manage:scanFetch.processing');
   const waited = state.waited_seconds ? t('manage:scanFetch.waited', { elapsed: elapsedText(state.waited_seconds) }) : '';
   return state.current_asset_name
     ? t('manage:scanFetch.currentLine', { file: state.current_asset_name, action, waited })
@@ -277,7 +286,7 @@ export function currentLine(state: LibraryProcessingData): string {
 /** 已知总量显示实际完成数；扫描目录期间显示持续发现的文件数。 */
 export function processingLine(state: LibraryProcessingData): string {
   const count = state.total ? t('manage:scanFetch.progressCount', { progress: progressText(state.checked, state.total) })
-    : state.current_action === 'scanning_files' || state.stage === '扫描文件' // i18n-exempt: 服务端阶段名
+    : state.current_action === 'scanning_files' || state.stage_code === 'library.scanFiles'
       ? t('manage:scanFetch.filesFound', { count: state.scanned || 0 }) : '';
   return currentLine(state) + (count ? ` · ${count}` : '');
 }
@@ -301,7 +310,7 @@ export function issueDetails(state: LibraryProcessingData): IssueDetails | null 
       key: `${issue.asset_id ?? 'source'}-${at}`,
       label: issue.title || (issue.asset_id ? t('manage:scanFetch.issueVideo', { id: issue.asset_id }) : t('manage:shared.storage')),
       href: issue.asset_id ? `/assets/${issue.asset_id}` : '',
-      note: issue.message,
+      note: codedText(issue, 'message'),
       hint: issue.path || '',
     })),
     log: state.issues_log || '',

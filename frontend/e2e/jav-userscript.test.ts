@@ -13,7 +13,7 @@ const MANIFEST: { version: number; sites: Site[] } = JSON.parse(readFileSync(
 const SCRIPT = readFileSync(new URL('../../web/integrations/peach-jav.user.js', import.meta.url), 'utf8');
 const VERSION: string = JSON.parse(readFileSync(
   new URL('../../web/integrations/jav-userscript-release.json', import.meta.url), 'utf8')).version;
-const RELEASE_META = 'https://update.sleazyfork.org/scripts/600821/Peach%20%C2%B7%20JAV%20%E5%85%A5%E5%BA%93.meta.js';
+const RELEASE_META = 'https://update.sleazyfork.org/scripts/600821/Peach%20%E7%94%A8%E6%88%B7%E8%84%9A%E6%9C%AC.meta.js';
 const TOKEN = 'test-only-peach-jav-secret-8b4d';
 const BASE = 'https://peach.example.invalid';
 const ROOT = '#peach-jav-action';

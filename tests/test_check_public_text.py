@@ -83,6 +83,36 @@ class InsiderTermsTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(insider_terms(text), [])
 
+    def test_relative_references_that_do_not_say_what_they_mean_are_named(self):
+        cases = {"剩余模块下一步再抽": "剩余模块", "剩余页面组一次抽完": "剩余页面组", "其余路由照旧": "其余路由",
+                 "前几批已经带上 code": "前几批", "另起一批处理": "另起一批", "本批的改动只动后端": "本批的",
+                 "同批检查已通过": "同批检查", "合进集成批次": "集成批次", "叠在最上层 PR 上": "最上层 PR",
+                 "维护者本轮重跑过": "维护者本轮", "本轮组合的结果": "本轮组合", "两轮主线都绿": "两轮主线",
+                 "这次是发布收口": "发布收口"}
+        for text, term in cases.items():
+            with self.subTest(text=text):
+                [line] = insider_terms(text)
+                self.assertTrue(line.startswith("相对指代："), line)
+                self.assertIn(term, line)
+
+    def test_circled_batch_numbers_and_made_up_baselines_are_named(self):
+        for text, kind, term in (("第③b批合入", "批次与轮次", "第③b批"), ("批次 ②", "批次与轮次", "批次 ②"),
+                                 ("中文基线收紧", "自造用语", "中文基线"), ("以本轮组合分支为基线", "自造用语", "为基线"),
+                                 ("基线 ab2b7d6d 上通过", "自造用语", "基线 ab2b7d6d"),
+                                 ("协调者统一执行", "本机交付流程", "协调者")):
+            with self.subTest(text=text):
+                found = [line for line in insider_terms(text) if line.startswith(kind + "：")]
+                self.assertEqual(len(found), 1, insider_terms(text))
+                self.assertIn(term, found[0])
+
+    def test_the_same_words_in_ordinary_use_pass(self):
+        for text in ("磁盘剩余空间不足时停下。", "英文界面里其余显示英文。", "这一批不再重复问。",
+                     "撞上 403 就停止本批联网。", "同批更新锁与映射表。", "关闭弹窗后不再请求后续批次。",
+                     "任务卡、回执和失败提示排进同一个通知栈，不再叠在一处。", "播放、音量与时间共用一条基线。",
+                     "本轮检查的来源名称保留在详情里。", "③a 任务中心的说明句"):
+            with self.subTest(text=text):
+                self.assertEqual(insider_terms(text), [])
+
 
 class PublishCommandTests(unittest.TestCase):
     def setUp(self):

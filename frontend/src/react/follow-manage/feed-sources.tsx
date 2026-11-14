@@ -52,6 +52,7 @@ import {
   checkFeeds, errorHeadline, FEEDS_KEY, feedIntervalText, fetchFeeds, removeFeed, setFeedEnabled,
   pageWindow, type FeedSource,
 } from './follow-manage';
+import { codedText } from '../../core/server-text';
 import { t } from '../../i18n';
 
 const feedTableFeatures = tableFeatures({
@@ -276,7 +277,7 @@ export function FeedSources({ readOnly, toast, onAdd, selection }: {
           );
         },
       }),
-      column.accessor((row) => row.kind_label, {
+      column.accessor((row) => codedText(row, 'kind_label'), {
         id: 'kind',
         header: label('kind'),
         cell: (context) => <span className="whitespace-nowrap">{context.getValue()}</span>,
@@ -400,8 +401,8 @@ export function FeedSources({ readOnly, toast, onAdd, selection }: {
             <Note tone="error" title={t('follow:feedSources.failedTitle', { count: failing.length })}
               extra={<ul className="flex flex-col gap-0.5 text-body-2-regular">
                 {failing.map((source) => (
-                  <li key={source.id} className="min-w-0 truncate" title={source.last_error || ''}>
-                    {t('follow:shared.labeled', { label: feedName(source), value: errorHeadline(source.last_error || '') || t('follow:shared.noReason') })}
+                  <li key={source.id} className="min-w-0 truncate" title={codedText(source, 'last_error')}>
+                    {t('follow:shared.labeled', { label: feedName(source), value: errorHeadline(codedText(source, 'last_error')) || t('follow:shared.noReason') })}
                   </li>
                 ))}
               </ul>}>

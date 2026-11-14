@@ -19,6 +19,7 @@ import { useSidebarReorder } from '../sidebar/use-sidebar-reorder';
 import { busyProps } from '../settings/busy-props';
 import { favoriteHref, isFavorite, useShortcuts, useShortcutWrite, type Favorite } from './library-shortcuts';
 import { t } from '../../i18n';
+import { codedText } from '../../core/server-text';
 import './shortcuts.css';
 
 const Star = spriteGlyph('star');
@@ -171,7 +172,7 @@ function ShortcutContents({ currentHref, kind, close }: { currentHref?: () => st
       </nav>
       </aside>
       <div ref={content} data-shortcuts-content="" role="tabpanel" id={`${id}-content`} aria-labelledby={`${id}-${scope}`} tabIndex={0} className="flex min-h-0 min-w-0 flex-col gap-4 overflow-y-auto overscroll-contain">
-    {query.isPending ? <div aria-busy="true" data-skeleton="" className="h-12 animate-pulse rounded-lg bg-background-secondary-default" /> : null}
+    {query.isPending ? <div aria-busy="true" data-skeleton="" className="relative h-12 rounded-lg skeleton-sheen" /> : null}
     {query.isError ? <Note tone="error" action={<Button variant="secondary" onClick={() => void query.refetch()}>{t('settings:shared.retryNow')}</Button>}>{errorMessage(query.error)}</Note> : null}
     {write.isError ? <Note tone="error">{errorMessage(write.error)}</Note> : null}
     {data ? scope !== 'filters' ? <>
@@ -214,7 +215,7 @@ function ShortcutContents({ currentHref, kind, close }: { currentHref?: () => st
 
 function FavoriteAvatar({ item }: { item: Favorite }) {
   const Glyph = GLYPHS[item.kind as keyof typeof GLYPHS] || Star;
-  return <span data-shortcuts-avatar="" title={item.image_label || item.name}>
+  return <span data-shortcuts-avatar="" title={codedText(item, 'image_label') || item.name}>
     {item.image_url ? <img src={item.image_url} alt="" loading="lazy" decoding="async"
       data-drop="self" data-fallbacks={item.image_fallbacks?.join('|') || undefined} /> : null}
     <Glyph aria-hidden className="size-5" />

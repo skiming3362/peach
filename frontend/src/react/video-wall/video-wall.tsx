@@ -14,7 +14,7 @@ import { busyProps } from '../settings/busy-props';
 import { useWallCamera } from './use-wall-camera';
 import { expandedWallTiles, finiteWallTile, visibleWallTiles, wallTileAt, WallExploration, type WallCamera, type WallTile } from './wall-layout';
 import { WALL_REFLOW_SPRING } from './wall-motion';
-import { chooseItem, fetchQueue, nextPart, partLabel, queueKey, type QueueItem, type QueueRef } from '../item-detail/item-detail';
+import { chooseItem, editionLabel, fetchQueue, nextPart, partLabel, queueKey, type QueueItem, type QueueRef } from '../item-detail/item-detail';
 import { WallControls } from './wall-controls';
 import { WallQueue } from './wall-queue';
 import { Shuffle } from '../entity-filter/entity-filter-page';
@@ -316,7 +316,7 @@ export function VideoWall({ items, finite, hasMore, busy, loading = false, error
     <div data-wall-focus-head=""><b ref={codeTitle} data-wall-code={current.code ? '' : undefined}>{current.code || label(current)}</b>
       {current.code ? <strong>{label(current).startsWith(current.code) ? label(current).slice(current.code.length).trim() : label(current)}</strong> : null}
       <span>{current.performers?.join(' · ') || current.creator || t('catalog:shared.uncredited')}</span>
-      {group ? <small>{[(current as QueueItem).edition_label, (current as QueueItem).part_label ? partLabel((current as QueueItem).part_label) : ''].filter(Boolean).join(' · ')}</small> : null}
+      {group ? <small>{[editionLabel(current as QueueItem), partLabel(current as QueueItem)].filter(Boolean).join(' · ')}</small> : null}
     </div>
     <button type="button" data-wall-focus-close="" aria-label={t('catalog:videoWall.collapseVideo')} title={t('catalog:shared.collapse')} onClick={() => close()}><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-x" /></svg></button>
     {error || (groupRef && groupQuery.error && !group) ? <div data-wall-play-error=""><Note tone="error">{error || requestErrorMessage(groupQuery.error)}</Note>

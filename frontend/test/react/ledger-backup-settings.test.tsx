@@ -87,7 +87,7 @@ it('确认后发出恢复，恢复中禁用全部按钮并显示进度，完成�
   expect(sent).toEqual([['/api/configuration/ledger-backups/restore',
     { id: 'database/ledger.pre-manual-20261104-101500.db', confirm: true }]]);
   const bar = host.querySelector('[role="progressbar"]')!;
-  expect([bar.getAttribute('aria-label'), bar.getAttribute('aria-valuenow')]).toEqual(['恢复进度', '3']);
+  expect([bar.getAttribute('aria-label'), bar.getAttribute('aria-valuenow')]).toEqual(['恢复进度 · 复制备份', '3']);
   expect(host.textContent).toContain('复制备份');
   expect(buttonNamed('立即备份', host)!.disabled).toBe(true);
   expect([...host.querySelectorAll('button')].filter((button) => button.textContent === '恢复')

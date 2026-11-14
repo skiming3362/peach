@@ -10,6 +10,10 @@
 **两处起跑。** 登记一条缺资料或缺封面的想要，当场起一轮 `want_job`；Feed 每拉一轮订阅，
 跑完顺带再起一轮，作为取不到时的重试。两处读同一份 `backlog`，隔 `RETRY_AFTER` 才重试，
 取不到的原因写在行上的 `scrape_error`。
+
+**定时查资源。** 订阅源定时拉取每一跳（`feeds.TICK_MINUTES`）顺带调 `start_search`：
+`wants.due_targets` 有到期的就起一轮 `want_search_job`，逐条查资源并经 `wants.record_search`
+记账。只记账、不提交下载；查到的资源在清单卡片上照常手动添加。
 """
 from __future__ import annotations
 
@@ -19,6 +23,7 @@ from urllib.parse import quote
 
 from . import feed_followup, wants, web_follow
 from .jobs import TaskRunConflict
+from .user_messages import UserInterruptedError, UserValueError
 
 #: 取不到资料或封面的想要，隔多久再试一次；与 Feed 壳同一个间隔。
 RETRY_AFTER = feed_followup.RETRY_AFTER
@@ -112,7 +117,7 @@ def scrape(contract, job_id: str | None = None) -> dict:
             if job_id:
                 if not contract.want_job.update(job_id, checked=len(done), total=len(done) + len(batch),
                                                 current=want_id):
-                    raise InterruptedError('想要资料任务已停止')
+                    raise UserInterruptedError("errors.webWants.scrapeStopped")
             got, covered = _scrape_one(contract, provider, want_id)
             fetched += got
             covers += covered
@@ -128,7 +133,7 @@ def scrape(contract, job_id: str | None = None) -> dict:
                 incomplete.discard(want_id)
             if job_id and not contract.want_job.checkpoint(job_id, completed_wants=sorted(completed),
                     incomplete_wants=sorted(incomplete), checked=len(done), fetched=fetched, covers=covers):
-                raise InterruptedError('想要资料任务已停止')
+                raise UserInterruptedError("errors.webWants.scrapeStopped")
     contract.cache_bust()
     return {"ok": True, "total": len(done), "fetched": fetched, "covers": covers,
             "incomplete": len(incomplete)}
@@ -150,6 +155,121 @@ def start_scrape(contract, *, trigger: str = "manual") -> dict | None:
                                        initial={"ok": True, "checked": 0, "total": 0, "current": None})
     except TaskRunConflict:
         # 另一个进程占着这把互斥键：登记已经落库，资料留给下一轮。
+        return None
+
+
+#: 定时查找一轮最多查几部。每部问三个来源、两部之间隔 3 秒，一轮十来分钟；剩下的下一跳接着查。
+SEARCH_PER_RUN = 48
+#: 连续几部来源失败就停下这一轮：多半是断网或来源在冷却，接着敲只会白耗流量。
+SEARCH_FAILURE_STREAK = 3
+#: 一轮因来源失败停下后，至少隔多久再起下一轮；来源给了更长的等待就按它的。
+SEARCH_PAUSE = timedelta(hours=1)
+#: 卡片上查过、还不到这么久的结果直接拿来记账，不再问一遍来源。
+SEARCH_REUSE = wants.FRESH_SEARCH_EVERY
+#: 清单页正在按需查（查询锁被占着）时，隔多久再试、最多试几次。
+_BUSY_WAIT, _BUSY_TRIES = 3.0, 20
+
+
+def _searched_at(result: dict) -> float:
+    try:
+        return datetime.fromisoformat(str(result.get("checked_at") or "")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _search_one(contract, code: str, release_date: str | None,
+                sleep=time.sleep) -> tuple[str, str, float | None] | None:
+    """查一部，返回 (结果, 说明, 来源让等的秒数)；清单页一直占着查询锁就返回 None，这一部留给下一轮。
+
+    查询与清单卡片的资源区是同一个 `MagnetSearch`：同一把锁、同一个请求间隔，查到的结果
+    写进同一份缓存，卡片和「有磁链」筛选马上能看到。查到与否按浏览器添加的判据
+    （`jav_browser._download_candidate`）：番号相符、不是预告的磁力才算查到。
+    """
+    from .jav_browser import _download_candidate
+    from .javdb_public import public_cache_scope
+    from .wants_magnets import search_for
+
+    searcher = search_for(contract.follow_secrets_root)
+    with public_cache_scope(contract.cover_root.parent / 'jav-public'):
+        for _attempt in range(_BUSY_TRIES):
+            result = searcher.query(code, released=release_date)
+            if result.get("state") != "busy" and _searched_at(result) < time.time() - SEARCH_REUSE.total_seconds():
+                result = searcher.query(code, refresh=True, released=release_date)
+            if result.get("state") != "busy":
+                break
+            sleep(_BUSY_WAIT)
+        else:
+            return None
+    magnets = [item for item in result.get("items") or () if item.get("protocol") == "magnet"]
+    candidate = _download_candidate(magnets, code)
+    if candidate is not None:
+        return "found", str(candidate.get("name") or ""), None
+    if result.get("state") == "ready" and not result.get("warnings"):
+        return "none", "", None
+    after = result.get("retry_after")
+    return "error", str(result.get("error") or ""), after if type(after) in (int, float) else None
+
+
+def search(contract, job_id: str | None = None, *, sleep=time.sleep) -> dict:
+    """查一轮到期的想要并逐条记账（`wants.record_search`）。来源连续失败就停下，隔一阵再起。"""
+    previous = (contract.want_search_job.snapshot() or {}) if job_id else {}
+    counts = {name: int(previous.get(name) or 0) for name in ("found", "none", "failed")}
+    done = set(previous.get("searched_wants") or [])
+    with contract.database.read_connection() as connection:
+        targets = [target for target in wants.due_targets(connection) if target.id not in done]
+    targets = targets[:max(0, SEARCH_PER_RUN - len(done))]
+    total, streak, paused = len(done) + len(targets), 0, False
+    for target in targets:
+        if job_id and not contract.want_search_job.update(
+                job_id, checked=len(done), total=total, current=target.code):
+            raise UserInterruptedError("errors.webWants.searchStopped")
+        searched = _search_one(contract, target.code, target.release_date, sleep=sleep)
+        done.add(target.id)
+        if searched is None:
+            continue
+        outcome, note, after = searched
+        try:
+            with contract.database.write_transaction() as connection:
+                wants.record_search(connection, target.id, outcome, note=note)
+        except UserValueError:
+            continue  # 查的时候被移除了
+        counts["failed" if outcome == "error" else outcome] += 1
+        streak = streak + 1 if outcome == "error" else 0
+        if job_id and not contract.want_search_job.checkpoint(
+                job_id, searched_wants=sorted(done), checked=len(done), **counts):
+            raise UserInterruptedError("errors.webWants.searchStopped")
+        if outcome == "error" and (after is not None or streak >= SEARCH_FAILURE_STREAK):
+            contract.want_search_resume_at = time.monotonic() + max(
+                float(after or 0), SEARCH_PAUSE.total_seconds())
+            paused = True
+            break
+    contract.cache_bust()
+    return {"ok": True, "total": len(done), **counts, "paused": paused}
+
+
+def start_search(contract, *, trigger: str = "scheduled") -> dict | None:
+    """有到期的想要就起一轮 `want_search_job`；没有、正在跑或来源失败后还在歇着就不起。"""
+    from .job_recovery import current_job_id
+    resuming = bool(current_job_id.get())
+    if not resuming:
+        resume_at = getattr(contract, "want_search_resume_at", None)
+        if resume_at is not None and time.monotonic() < resume_at:
+            return None
+        if (contract.want_search_job.snapshot() or {}).get("status") == "running":
+            return None
+        with contract.database.read_connection() as connection:
+            if not wants.due_targets(connection):
+                return None
+
+    def work(job_id):
+        result = search(contract, job_id)
+        contract.want_search_job.update(job_id, **result, status="complete", current=None,
+                                        completed_at=time.time())
+    try:
+        return contract.want_search_job.start(
+            work, restart=True, trigger=trigger, recovery={},
+            initial={"ok": True, "checked": 0, "total": 0, "current": None})
+    except TaskRunConflict:
         return None
 
 
@@ -200,8 +320,10 @@ def q_wants(contract, args) -> dict:
     for item in items:
         counts[item["phase"]] += 1
     snapshot = contract.want_job.snapshot() or {}
+    searching = contract.want_search_job.snapshot() or {}
     return {"ok": True, "items": items, "counts": counts,
-            "scraping": snapshot.get("status") == "running"}
+            "scraping": snapshot.get("status") == "running",
+            "searching": searching.get("status") == "running"}
 
 
 def _ids(body) -> list[int]:
@@ -219,11 +341,11 @@ def q_want_magnets(contract, args) -> dict:
 
     raw = str(args.get("id") or "")
     if not raw.isdigit():
-        raise ValueError("缺少想要条目编号")
+        raise UserValueError("api.wants.missingId")
     with contract.database.read_connection() as connection:
         row = wants.get(connection, int(raw))
     if row is None:
-        raise KeyError("想要条目不存在")
+        raise KeyError("want not found")
     if not row["code"] or wants.phase(row, date.today()) in {"unreleased", "acquired"}:
         return {"ok": True, "state": "unavailable", "items": [], "error": "", "checked_at": None}
     # JavDB 匿名资料与详情页共用快照目录。

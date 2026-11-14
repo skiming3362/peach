@@ -14,7 +14,8 @@ import {
   MEDIA_PROCESSING_KEY, MEDIA_PROCESSING_URL, THUMBNAIL_JOBS_KEY, fetchMediaProcessing, type MediaProcessingPolicy,
 } from '../settings-panel/settings-data';
 import { LIBRARY_PROCESSING_KEY } from '../library-processing/library-processing';
-import { ErrorText, Help, Rows, Section, Stack } from './section';
+import { TaskProgress } from '../components/task-progress';
+import { ErrorText, Rows, Section, Stack } from './section';
 import { useAction } from './use-action';
 import { VideoThumbnailControls } from './service-preferences';
 import { t } from '../../i18n';
@@ -57,7 +58,7 @@ export function MediaProcessingSettings({ receipt }: { receipt(message: string):
           </div>
         </SettingsRow>
       </Rows>
-      {action.busy ? <Stack divided><Help role="status">{t('settings:shared.saving')}</Help></Stack> : null}
+      {action.busy ? <Stack divided><TaskProgress embedded kind="gather" label={t('settings:shared.saving')} /></Stack> : null}
       {error ? <Stack divided><ErrorText>{error}</ErrorText></Stack> : null}
     </Section>
   );
@@ -88,7 +89,7 @@ export function PlaybackTranscodeSettings({ receipt }: { receipt(message: string
           </div>
         </SettingsRow>
       </Rows>
-      {action.busy ? <Stack divided><Help role="status">{t('settings:shared.saving')}</Help></Stack> : null}
+      {action.busy ? <Stack divided><TaskProgress embedded kind="gather" label={t('settings:shared.saving')} /></Stack> : null}
       {error ? <Stack divided><ErrorText>{error}</ErrorText></Stack> : null}
     </Section>
   );

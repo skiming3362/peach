@@ -15,7 +15,7 @@ import { useInfiniteQuery, useQuery, type InfiniteData, type QueryKey } from '@t
 import { mixFace as mixArtwork, mixLabel, relayoutCovers, type Artwork } from '@peach/card-art';
 import { isOverlayPath, peachHistory } from '@peach/history';
 import { requestErrorMessage } from '@peach/legacy/core';
-import { LOAD_MORE_STATUS, loadingDotsHtml } from '@peach/legacy/ui';
+import { activityStatusHtml, LOAD_MORE_STATUS } from '@peach/legacy/ui';
 
 import { apiGet } from '../../api';
 import { PLAYBACK_PROGRESS_EVENT, type PlaybackProgress } from '../../player/telemetry';
@@ -319,7 +319,7 @@ export function LoadMore({ entity, load, enabled, children }: {
         ? <button ref={attach} type="button" data-entity-more="" {...aria} onClick={() => void run(true)}>{children ?? t('catalog:shared.loadMore')}</button>
         /* 失败时只留下面那条重试：哨兵收起但不卸下，重试接上之后照旧由它续页。 */
         : <div ref={attach} data-load-more="" {...aria} hidden={Boolean(state.error)} onClick={() => void run(true)}
-          dangerouslySetInnerHTML={{ __html: loadingDotsHtml(LOAD_MORE_STATUS) }} />}
+          dangerouslySetInnerHTML={{ __html: activityStatusHtml('linear-dots', LOAD_MORE_STATUS) }} />}
       {state.error ? <RetryNote message={state.error} onRetry={() => void run(true)} /> : null}
     </>
   );

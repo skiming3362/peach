@@ -19,14 +19,15 @@ import { Note } from '../components/note';
 import { DataTableFooter } from '../components/table-controls';
 import { pageWindow } from '../follow-manage/follow-manage';
 import { ErrorLine } from '../follow-manage/source-view';
-import { Help } from '../settings/section';
+import { TaskProgress } from '../components/task-progress';
+import { activityKind } from '../../activity-kinds';
 import { WantMagnets } from './want-magnets';
 import { cachedMagnetStates } from './resource-cache';
 import { SEGMENT, SEGMENTED_TRACK, SegmentedRadioGroup } from '../components/segmented';
 import { busyProps, useAction } from '../settings/use-action';
 import { composingKey } from '../components/ime';
 import {
-  addWant, fetchWants, invalidateWants, PHASES, removeWants, resetWants, searchNote, wantName,
+  addWant, fetchWants, invalidateWants, lastSearchNote, PHASES, removeWants, resetWants, searchNote, wantName,
   WANTS_KEY, type Want,
 } from './wants';
 import { t } from '../../i18n';
@@ -59,6 +60,8 @@ function WantRow({ want, readOnly, busy, onReset, onRemove, onCloudDownload, dow
 }) {
   const [resolvedSource, setResolvedSource] = useState('');
   const source = want.link || resolvedSource || (want.code ? `https://javdb.com/search?q=${encodeURIComponent(want.code)}&f=all` : '');
+  // 有番号还在找的，资源区自己说明查到了什么，这里只给上次定时查找的结果。
+  const note = want.code && want.phase === 'searching' ? lastSearchNote(want) : searchNote(want);
   return (
     <li data-want-id={want.id}
       className={cardClass({ className: 'flex flex-col gap-4 max-sm:p-4' })}>
@@ -72,8 +75,7 @@ function WantRow({ want, readOnly, busy, onReset, onRemove, onCloudDownload, dow
           ) : null}
         </p>
         {facts(want) ? <p className="text-body-2-regular text-text-secondary">{facts(want)}</p> : null}
-        {!want.code || want.phase === 'unreleased' || want.phase === 'acquired' ?
-          <p data-want-note="" className="text-caption-1-regular text-text-secondary">{searchNote(want)}</p> : null}
+        {note ? <p data-want-note="" className="text-caption-1-regular text-text-secondary">{note}</p> : null}
         {want.scrape_error ? <ErrorLine text={want.scrape_error} prefix={t('catalog:wants.metadataNotFound')} tone="muted" /> : null}
         <div className="mt-1 flex flex-wrap items-center gap-2">
           {source ? <ButtonLink data-button-link="" variant="secondary" size="small" trailingIcon={RiExternalLinkLine} href={source} target="_blank" rel="noopener noreferrer">{t('catalog:wants.sourcePage')}</ButtonLink> : null}
@@ -150,8 +152,8 @@ export function WantList({ readOnly, toast, query = '', clearQuery }: WantListPr
   const wants = useQuery({
     queryKey: WANTS_KEY, queryFn: ({ signal }) => fetchWants(signal),
     staleTime: 30_000,
-    // 刚登记的那几条还在取资料：跑着就隔几秒再读一次，取完了就停。
-    refetchInterval: (query) => (query.state.data?.scraping ? 3000 : false),
+    // 刚登记的那几条还在取资料：跑着就隔几秒再读一次，取完了就停。定时查资源一部要十来秒，隔得松一些。
+    refetchInterval: (query) => (query.state.data?.scraping ? 3000 : query.state.data?.searching ? 10_000 : false),
   });
 
   const add = () => {
@@ -206,7 +208,8 @@ export function WantList({ readOnly, toast, query = '', clearQuery }: WantListPr
 
       {wants.error ? <Note tone="error" title={t('catalog:wants.loadFailed')}>{errorMessage(wants.error)}</Note> : null}
       {wants.isPending ? <div role="status" aria-label={t('catalog:wants.loading')} dangerouslySetInnerHTML={{ __html: javContentSkeleton('wants') }} /> : null}
-      {data?.scraping ? <Help role="status">{t('catalog:wants.fetchingNew')}</Help> : null}
+      {data?.scraping ? <TaskProgress embedded kind={activityKind('want-scrape')} label={t('catalog:wants.fetchingNew')} /> : null}
+      {data?.searching ? <TaskProgress embedded kind={activityKind('want-search')} label={t('catalog:wants.searchingResources')} /> : null}
       {downloads.error ? <Note tone="error" title={t('catalog:wants.downloadSettingsFailed')}>{errorMessage(downloads.error)}</Note> : null}
       {downloads.data && !configured.length ? <Note tone="neutral">{t('shell:downloadChannels.notConfigured')}{t('shell:format.sentenceGap')}<a href="/settings/downloads">{t('shell:downloadChannels.settingsLink')}</a></Note> : null}
       {downloads.data && !downloads.data.available ? <Note tone="neutral">{t('catalog:wants.cloudPrimaryOnly')}</Note> : null}

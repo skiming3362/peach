@@ -36,12 +36,19 @@ import {
   photosOptions, tagList, tagPressed, type EntityPageData, type EntityPageProps, type PhotoPage,
 } from './entity-page';
 import { useEntityOnline } from './use-entity-online';
-import { PENDING_REFETCH_MS } from '../components/pending-work';
+import { PENDING_REFETCH_MS, usePendingWorkRefetch } from '../components/pending-work';
+import { pollUntil } from '../../polling';
 import { t } from '../../i18n';
+import { codedText } from '../../core/server-text';
+
+/** 订上新作后等服务端那一轮拉取：几秒问一次，最多等两分钟。 */
+const FEED_CHECK_POLL_MS = 3000;
+const FEED_CHECK_LIMIT_MS = 120_000;
 
 export function EntityPage(props: EntityPageProps) {
   const { kind, name } = props;
   const entity = useQuery(entityOptions(kind, name));
+  usePendingWorkRefetch(entity.data?.pending_work, entityKey(kind, name));
   /* 名字对不上任何一位时 `/api/entity` 回 `{error}`：整块换成壳里那一屏空态，骨架不留着闪。空态是
      遗留层的标记，不放进 React 子树的样式范围。 */
   const missing = !!entity.data?.error;
@@ -211,7 +218,9 @@ function EntityLoaded(props: EntityPageProps & { entity: EntityPageData }) {
 
   /* ── 写操作 ── */
   const alive = useRef(true);
-  useEffect(() => () => { alive.current = false }, []);
+  /** 页面卸下时中止还在等的状态循环（`refreshFeedAfterCheck`）。 */
+  const lifetime = useRef<AbortController | null>(null);
+  useEffect(() => () => { alive.current = false; lifetime.current?.abort() }, []);
   const refreshEntity = useCallback(async () => {
     await queryClient.invalidateQueries({ queryKey: ['entity-route'] });
     await queryClient.invalidateQueries({ queryKey: entityKey(kind, name) });
@@ -271,17 +280,18 @@ function EntityLoaded(props: EntityPageProps & { entity: EntityPageData }) {
         throw error;
       }
     },
-    /* 「订阅新作」打开时服务端当场在后台拉一轮：等那一轮跑完再把新作那一行重取一次。等的上限是
-       那一轮自己的时长量级，页面换走了就不再等。 */
+    /* 「订阅新作」打开时服务端当场在后台拉一轮：等那一轮跑完再把新作那一行重取一次。三秒问一次，
+       读失败退避，页面不可见时暂停；等的上限是那一轮自己的时长量级，页面换走了就不再等。 */
     refreshFeedAfterCheck: () => {
-      void (async () => {
-        for (let tries = 0; tries < 40 && alive.current; tries += 1) {
-          await new Promise((resolve) => { setTimeout(resolve, 3000) });
-          const job = await (api('/api/feeds/check') as Promise<{ status?: string }>).catch(() => null);
-          if (!job || job.status !== 'running') break;
-        }
-        if (alive.current) await queryClient.invalidateQueries({ queryKey: feedNewKey(entityId) });
-      })();
+      lifetime.current ??= new AbortController();
+      void pollUntil<{ status?: string }>({
+        signal: lifetime.current.signal, everyMs: FEED_CHECK_POLL_MS, limitMs: FEED_CHECK_LIMIT_MS,
+        read: () => api('/api/feeds/check') as Promise<{ status?: string }>,
+        apply: () => {},
+        done: (job) => job.status !== 'running',
+      }).then(() => {
+        if (alive.current) void queryClient.invalidateQueries({ queryKey: feedNewKey(entityId) });
+      });
     },
     feedAction: postFeedAction,
     /* 圆框角上那个加号：头像索引在服务端已经换过。资料与作品列表一起重取（作品卡署名里也是
@@ -405,7 +415,7 @@ function EntityLoaded(props: EntityPageProps & { entity: EntityPageData }) {
       picked ? t('catalog:tagFilters.selectedCount', { count: picked }) : '',
     ].filter(Boolean).join(' · ') : '';
   } else if (wallPage && !wallPage.error) {
-    readout = inSet ? t('catalog:entityPage.setImageCount', { title: wallPage.title, count: wallPage.total || 0 })
+    readout = inSet ? t('catalog:entityPage.setImageCount', { title: codedText(wallPage, 'title'), count: wallPage.total || 0 })
       : photoReadout(wallPage, codeSetsOf(wallPage).length);
   } else busy = wall.isPending;
 

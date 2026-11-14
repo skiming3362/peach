@@ -15,6 +15,11 @@ import re
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(ROOT / "src"))
+
+from peach.interface_text import dev as t  # noqa: E402
+
 TEMPLATES = ROOT / ".github/ISSUE_TEMPLATE"
 LABEL = "status:needs-template"
 MAINTAINERS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
@@ -89,11 +94,11 @@ def notice_ids(comments: list[dict]) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=t("issue_intake.description"))
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--event", type=Path, help="GitHub issues 事件载荷文件")
-    group.add_argument("--notice", action="store_true", help="输出关闭时的说明")
-    group.add_argument("--notice-ids", type=Path, help="issue 评论列表文件；逐行输出要折叠的提示评论")
+    group.add_argument("--event", type=Path, help=t("issue_intake.eventHelp"))
+    group.add_argument("--notice", action="store_true", help=t("issue_intake.noticeHelp"))
+    group.add_argument("--notice-ids", type=Path, help=t("issue_intake.noticeIdsHelp"))
     args = parser.parse_args(argv)
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")

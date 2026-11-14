@@ -8,7 +8,7 @@ import { playerHost } from './host';
 import { detailPlayer, resizeSoon } from './registry';
 import { PLAYER_PANEL_EVENT } from './stats';
 import type { PlayerItem, SourceQuality, VjsPlayer } from './types';
-import { SubtitleControls, subtitleIcon } from './subtitles';
+import { SubtitleControls, languageName, subtitleIcon } from './subtitles';
 import { createSeekPreview } from './seek-preview';
 import { mountPlayerRotation } from './rotation';
 import { mountPlayerPipControl } from './pip';
@@ -648,13 +648,17 @@ export function mountPlayerMediaSession(player: VjsPlayer, item: PlayerItem): vo
 }
 
 /** 加载提示复用 YouTube e937390a 的 `FsY`：四段嵌套元素与四段动画。 */
+/** 播放器缓冲那一圈（`player.css` 的 `vjs-peach-spinner-*`）。沉浸页等媒体加载用同一份，媒体等待只有这一种转圈。 */
+export const PLAYER_SPINNER_HTML = '<span class="vjs-peach-spinner-container"><span class="vjs-peach-spinner-rotator"><span class="vjs-peach-spinner-left"><span class="vjs-peach-spinner-circle"></span></span><span class="vjs-peach-spinner-right"><span class="vjs-peach-spinner-circle"></span></span></span></span>';
+
 export function mountPlayerSpinner(player: VjsPlayer): void {
   const spinner = player.el().querySelector('.vjs-loading-spinner');
   if (!spinner || spinner.querySelector('.vjs-peach-spinner-container')) return;
-  spinner.innerHTML = '<span class="vjs-peach-spinner-container"><span class="vjs-peach-spinner-rotator"><span class="vjs-peach-spinner-left"><span class="vjs-peach-spinner-circle"></span></span><span class="vjs-peach-spinner-right"><span class="vjs-peach-spinner-circle"></span></span></span></span>';
+  spinner.innerHTML = PLAYER_SPINNER_HTML;
 }
 
 /** 本机资产的外挂字幕。服务端已经把 srt/ass/ssa 换成 WebVTT，这里只把它挂成 text track。
+ *  认出语言的轨道按语言码显示界面语言的语言名；`label` 是服务端的中文兜底或文件名多出来的那一段。
  *  一律不设 default：自动打开某一条等于替用户选了语言，而同一部片常有简体、繁体、日语三条。
  *  Peach 字幕菜单只在有轨的时候出现；轨道挂在原生 video 上，随同一枚元素保留。 */
 export function mountPlayerSubtitles(player: VjsPlayer, assetId: number): void {
@@ -662,7 +666,8 @@ export function mountPlayerSubtitles(player: VjsPlayer, assetId: number): void {
     .then((payload) => {
       if (!player || player.isDisposed()) return;
       (payload?.subtitles || []).filter((track) => track.playable).forEach((track) => {
-        player.addRemoteTextTrack({ id: track.id, kind: 'subtitles', src: track.src, srclang: track.language || '', label: track.label, default: false,
+        player.addRemoteTextTrack({ id: track.id, kind: 'subtitles', src: track.src, srclang: track.language || '',
+          label: track.language ? languageName(track.language) : track.label, default: false,
           ...(track.legacy_id ? { legacyId: track.legacy_id } : {}) }, true);
       });
     }).catch(() => {});

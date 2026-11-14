@@ -1,16 +1,17 @@
-/** 升级补修与程序安装分别显示；复核和重试都由用户明确发起。 */
+/** 升级补修与程序安装分别显示；复核和重试都由用户明确发起。进度读页面顶部横幅那份更新快照，本页不另查。 */
 import { useEffect, useState } from 'react';
 import { RiArrowRightLine } from '@remixicon/react';
 import { Button } from '@/components/base/buttons/button';
 import { LinkButton } from '@/components/base/buttons/link-button';
 import { REPAIR_CENTER_PATH } from '@peach/history';
 import { apiSend } from '../../api';
-import { useClientUpdates } from '../client-updates';
+import { checkClientUpdates, useClientUpdates } from '../client-updates';
 import type { ClientUpdates } from '../client-updates';
 import { AnimatedNumber } from '../components/animated-number';
 import { StatusLabel } from '../components/status-label';
 import { ErrorText, ExternalLink, Fact, FactList, Footer, Help, Section, Stack, TaskCenterLink, translateWithNodes } from './section';
 import { useAction } from './use-action';
+import { codedText } from '../../core/server-text';
 import { t } from '../../i18n';
 
 const LABELS: Record<string, string> = { pending: t('settings:upgradeRepairs.pending'), running: t('settings:upgradeRepairs.repairing'), failed: t('settings:repairCenter.needsRetry'),
@@ -32,7 +33,7 @@ export function UpgradeRepairs() {
   const retry = () => void action.run('retry', signal => apiSend<ClientUpdates['repairs']>(
     '/api/configuration/upgrade-repairs/retry', {}, 'POST', signal), next => {
     setSaved(next);
-    document.dispatchEvent(new Event('peach:client-updates'));
+    checkClientUpdates();
   });
   return <Section id="upgradeRepairs" title={t('settings:upgradeRepairs.title')} aside={<StatusLabel
     tone={state === 'failed' ? 'error' : state === 'running' ? 'progress' : state === 'review' ? 'warning'
@@ -43,7 +44,7 @@ export function UpgradeRepairs() {
       <Fact term={t('settings:shared.failed')}><span>{itemCount(failed)}</span></Fact>
       <Fact term={t('settings:upgradeRepairs.toReview')}><span>{itemCount(review)}</span></Fact>
     </FactList>
-    {data?.message || action.error ? <Stack><ErrorText>{action.error || data?.message}</ErrorText></Stack> : null}
+    {data?.message || action.error ? <Stack><ErrorText>{action.error || codedText(data, 'message')}</ErrorText></Stack> : null}
     {state === 'running' ? <Stack><Help>{t('settings:upgradeRepairs.runningHelp')}</Help><TaskCenterLink /></Stack> : null}
     <Footer status={review ? <ExternalLink href="/api/configuration/upgrade-repairs/review">{t('settings:upgradeRepairs.downloadReviewLog')}</ExternalLink> : null}>
       <LinkButton href={REPAIR_CENTER_PATH} size="small" trailingIcon={RiArrowRightLine}>{t('settings:upgradeRepairs.repairCenterLink')}</LinkButton>

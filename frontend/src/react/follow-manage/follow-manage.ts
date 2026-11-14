@@ -21,6 +21,7 @@ import { clampPage, pageCount } from '../../pagination';
 import { queryClient } from '../query';
 import { localTime } from '../time';
 import { t } from '../../i18n';
+import { codedText } from '../../core/server-text';
 
 export const FOLLOW_URL = '/api/follow';
 export const FOLLOW_CREDENTIALS_URL = '/api/follow/credentials';
@@ -68,6 +69,9 @@ export interface FollowSource {
   last_checked_at?: string | null;
   last_status?: string;
   last_error?: string;
+  /** 有 code 的按界面语言显示；旧记录只有原文。 */
+  last_error_code?: string;
+  last_error_params?: Record<string, unknown>;
   history_exhausted?: boolean;
 }
 
@@ -79,7 +83,11 @@ export interface AliasGroup {
 }
 
 /** 一条待合并的别名，带判定依据。合并永远由人点，服务端不自动升级。 */
-export interface AliasSuggestion { canonical: string; alias: string; evidence: string }
+export interface AliasSuggestion {
+  canonical: string; alias: string; evidence: string;
+  /** 依据那句的 code 与参数；有译文时显示译文。 */
+  evidence_code?: string; evidence_params?: Record<string, unknown>;
+}
 
 /** 「猜你喜欢」的一位创作者，来自用户自己浏览过的在线记录。 */
 export interface FollowGuess { name: string; visits: number; origin?: string }
@@ -107,9 +115,12 @@ export interface CredentialRow {
   shared_fields?: string[];
   present?: boolean;
   world_readable?: boolean | null;
+  /** 说明的原文，旁边的 `why_code`、`howto_code` 给当前语言。 */
   why?: string;
+  why_code?: string;
   where?: string;
   howto?: string;
+  howto_code?: string;
   path?: string;
 }
 
@@ -125,6 +136,8 @@ export interface CheckResult {
   ref?: string;
   error?: string;
   evidence_error?: string;
+  evidence_error_code?: string;
+  evidence_error_params?: Record<string, unknown>;
   added?: number;
   updated?: number;
   skipped?: number;
@@ -153,19 +166,35 @@ export interface ResolveCandidate {
   provider_label: string;
   url: string;
   label: string;
+  /** 站上没给标题时（「线程 123」）`label` 的 code 与参数。 */
+  label_code?: string;
+  label_params?: Record<string, unknown>;
   author?: string;
   aliases?: string[];
   evidence?: string;
+  evidence_code?: string;
+  evidence_params?: Record<string, unknown>;
   known?: boolean;
+}
+
+/** 站内索引没命中时交给人继续核对的外部搜索入口；`label`、`evidence` 各配 code 与参数。 */
+export interface ExternalSearch {
+  label: string; label_code?: string; label_params?: Record<string, unknown>;
+  query: string; url: string;
+  evidence: string; evidence_code?: string; evidence_params?: Record<string, unknown>;
 }
 
 export interface ResolveRow {
   kind?: string;
   line: string;
   error?: string;
+  error_code?: string;
+  error_params?: Record<string, unknown>;
   candidates?: ResolveCandidate[];
-  external_searches?: { label: string; query: string; url: string; evidence: string }[];
+  external_searches?: ExternalSearch[];
   failures?: Record<string, string>;
+  /** `failures` 里带 code 的那几条：来源 → code 与参数。 */
+  failure_codes?: Record<string, { code: string; params?: Record<string, unknown> }>;
 }
 
 export interface ResolveJob {
@@ -182,7 +211,8 @@ export interface ResolveJob {
 export interface SuggestGroup {
   kind: string;
   label: string;
-  items: { value: string; matched?: string; n?: number }[];
+  label_code?: string;
+  items: { value: string; matched?: string; matched_code?: string; n?: number }[];
 }
 export interface SuggestData { q: string; groups: SuggestGroup[] }
 
@@ -471,7 +501,7 @@ export const renameAliasGroup = (key: string, name: string, signal?: AbortSignal
 
 /** 保存或清除一个站点的凭据。`values` 为空就是清除。 */
 export const saveCredential = (provider: string, values: Record<string, string>) =>
-  apiSend<{ note?: string }>(FOLLOW_CREDENTIAL_URL, { provider, values });
+  apiSend<{ note?: string; note_code?: string }>(FOLLOW_CREDENTIAL_URL, { provider, values });
 
 /** 一次批量写最多几条，与 `w_follow_status` 收 `items` 的上限相同；一页待处理也最多这么多组。 */
 export const MARK_BATCH = 1000;
@@ -519,6 +549,7 @@ export interface FeedSource {
   id: number;
   kind: string;
   kind_label: string;
+  kind_label_code?: string;
   /** 挂着人物时是她在数据库里的统称，否则是存下的名字。 */
   name: string;
   /** 上次拉取时这一页在站上挂的名字。同一个人的旧艺名页靠它和本名页分开。 */
@@ -535,6 +566,8 @@ export interface FeedSource {
   interval_minutes: number;
   last_fetched_at: string | null;
   last_error: string | null;
+  last_error_code?: string;
+  last_error_params?: Record<string, unknown>;
   last_new_count: number;
   seen: number;
 }
@@ -587,6 +620,8 @@ export interface FeedLookup {
   known: { id: number; name: string; subscribable: boolean; following: boolean } | null;
   /** JavDB 这一趟没搜成的原因；只在库里的她能直接订时随结果一起回来，否则整次查找报错。 */
   unavailable?: string;
+  unavailable_code?: string;
+  unavailable_params?: Record<string, unknown>;
 }
 
 export const lookupFeedActor = (name: string, signal?: AbortSignal) =>
@@ -695,8 +730,10 @@ export function checkSummary(job: CheckJob): string {
 export const checkFailures = (job: CheckJob | null): CheckResult[] =>
   (job?.results || []).filter((row) => !row.ok);
 
-export const checkEvidenceGap = (job: CheckJob | null): string =>
-  (job?.results || []).find((row) => row.evidence_error)?.evidence_error || '';
+export const checkEvidenceGap = (job: CheckJob | null): string => {
+  const row = (job?.results || []).find((item) => item.evidence_error);
+  return row ? codedText(row, 'evidence_error') : '';
+};
 
 export { localTime };
 

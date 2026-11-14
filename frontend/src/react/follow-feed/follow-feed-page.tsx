@@ -8,7 +8,7 @@
  * 地址栏归壳：点筛选、排序、换媒体都只调 `actions.route`，壳写好地址再把新的 `view` 推回来。
  * 这一页唯一联网的动作是「检查更新」与「抓更早的一页」，两者起的是同一趟后台任务，进度由
  * `helpers.jobProgress` 盯着，跑完失效这一页的查询重取。 */
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useInfiniteQuery, useMutation, useQuery, type InfiniteData } from '@tanstack/react-query';
 import { esc, icon, leadingGraphemes, requestErrorMessage } from '@peach/legacy/core';
 import { tagLabel } from '@peach/legacy/tags';
@@ -33,6 +33,8 @@ import type { SegmentOption } from '../entity-filter/entity-filter';
 import { checkSummary, FOLLOW_CHECK_URL, FOLLOW_STATUS_URL, sourceIconUrl } from '../follow-manage/follow-manage';
 import { followManageEntry } from '../follow-manage/manage-route';
 import { Note } from '../components/note';
+import { TaskProgress } from '../components/task-progress';
+import type { FollowJobView } from '../../jobs';
 import { sidebarTagCounts } from '../../sidebar';
 import { queryClient } from '../query';
 import { pageNavigationReady } from '../../history/page-navigation';
@@ -177,8 +179,10 @@ export function FollowFeedPage(props: FollowFeedProps) {
 
   return (
     <>
-      {/* 进度那一格归 `followJobProgress`：它自己往里插面板、自己开合，React 只给一个空节点。 */}
-      <div key={job.generation} ref={job.host} data-follow-progress="" />
+      {/* 进度那一格：`followJobProgress` 盯任务、给出要画什么，这里用和其他后台任务同一套 `TaskProgress` 与 `Note` 画。 */}
+      {job.view ? <div data-follow-progress="">{job.view.status === 'running'
+        ? <TaskProgress kind={job.view.kind} label={job.view.label} value={job.view.value} total={job.view.total} />
+        : <Note tone={job.view.tone}>{job.view.message}</Note>}</div> : null}
       {credentialsResult.isError ? <RetryNote message={t('follow:followFeed.credentialStatusFailed')} onRetry={() => { void credentialsResult.refetch() }} /> : null}
       {!job.busy && job.report ? <Note tone="neutral" title={t('follow:followFeed.checkResults')}>{job.report}</Note> : null}
       <div data-follow-feed="" data-select-mode={props.selectMode ? '' : undefined}>
@@ -278,18 +282,17 @@ function useFollowJob(props: FollowFeedProps, ready: boolean) {
   const [report, setReport] = useState('');
   /* 往回抓那枚键在它起的那一趟跑完之前一直写「抓取中」，同遗留层：检查更新那一趟只让它忙、不换字。 */
   const [olderRun, setOlderRun] = useState(false);
+  const [view, setView] = useState<FollowJobView | null>(null);
   const busyRef = useRef(false);
-  const node = useRef<HTMLDivElement | null>(null);
   const latest = useRef({ helpers, actions });
   latest.current = { helpers, actions };
 
   useEffect(() => {
-    const host = node.current;
-    if (!host) return undefined;
+    if (!ready) return undefined;
     let alive = true;
     latest.current.helpers.jobProgress({
-      host,
       active: () => alive,
+      show: (next) => { if (alive) setView(next) },
       read: (signal) => apiGet<FollowJobState>(FOLLOW_CHECK_URL, signal),
       busy: (on) => {
         if (!alive) return;
@@ -336,7 +339,7 @@ function useFollowJob(props: FollowFeedProps, ready: boolean) {
   }, []);
 
   return {
-    generation, host: node as RefObject<HTMLDivElement | null>, busyRef, starting, start, report,
+    view, busyRef, starting, start, report,
     busy: running || starting !== '',
     olderBusy: starting === 'older' || (olderRun && running),
   };

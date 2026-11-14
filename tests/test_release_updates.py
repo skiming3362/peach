@@ -286,6 +286,9 @@ class DockerUpdateTests(unittest.TestCase):
         self.assertIn("令牌", docker_update.status(transport=transport)["reason"])
         docker_update.ensure_token()
         self.assertEqual(docker_update.status(transport=transport), {"available": True, "reason": ""})
+        with patch.dict("os.environ", {docker_update.IMAGE_TAG_ENV: "latest"}):
+            self.assertEqual(docker_update.status(transport=transport), {"available": True, "reason": ""},
+                             "latest 与 edge 同时推送，NAS 面板按 latest 部署也能一键更新")
         self.assertEqual(docker_update.status(transport=self.watchtower(202, reachable=False)[0]),
                          {"available": False, "reason": ""}, "没启用 watchtower profile 时照常给两步命令，不报错")
         for tag, message in (("0.53.0", ".env"), ("", "compose.yaml")):
@@ -406,8 +409,8 @@ class ReleaseNoticeTests(unittest.TestCase):
             for section in ('features', 'automatic', 'attention'):
                 for item in notice.get(section, []):
                     tokens = {part for token in item.get('platforms', []) for part in token.split('+')}
-                    self.assertLessEqual(tokens, release_notice.PLATFORM_TOKENS, (version, item['title']))
-                    self.assertIn(item.get('when', 'display_reprobe'), release_notice.FACTS, (version, item['title']))
+                    self.assertLessEqual(tokens, release_notice.PLATFORM_TOKENS, (version, item['id']))
+                    self.assertIn(item.get('when', 'display_reprobe'), release_notice.FACTS, (version, item['id']))
 
 
 class ReleaseNoticeFactsTests(unittest.TestCase):
@@ -430,3 +433,46 @@ class ReleaseNoticeFactsTests(unittest.TestCase):
         facts = routes_configuration._release_notice_facts(request, connection)
         self.assertEqual(facts, {'system_files': {'count': 2}, 'garbled_performers': {'count': 1},
                                  'javdb_entries': {'count': 3}})
+
+
+class ReleaseNoticeContentRuleTests(unittest.TestCase):
+    """公告只放使用者能明显感知的几条，图标按登记的含义挑（`release_notices` 模块说明）。"""
+
+    def setUp(self):
+        from peach import release_notice, release_notices
+        self.notice, self.notices = release_notice, release_notices
+        self.checked = {version: entry for version, entry in release_notices.NOTICES.items()
+                        if release_notice.version_key(version) >= release_notice.version_key(release_notices.RULES_SINCE)}
+        self.assertIn(release_notices.RULES_SINCE, self.checked)
+
+    def test_the_frontend_draws_exactly_the_registered_icons(self):
+        import re
+        source = (Path(__file__).resolve().parents[1] / 'frontend/src/react/release-notice.tsx').read_text(encoding='utf-8')
+        block = re.search(r'const ICONS: Record<string, RemixiconComponentType> = \{(.*?)\};', source, re.S)
+        self.assertIsNotNone(block)
+        self.assertEqual(set(re.findall(r'(\w+): Ri\w+', block[1])), set(self.notices.ICON_MEANINGS))
+
+    def test_every_notice_icon_is_registered_and_new_ones_avoid_generic_icons(self):
+        for version, entry in self.notices.NOTICES.items():
+            for group in ('features', 'automatic', 'attention'):
+                for item in entry.get(group, []):
+                    if 'icon' not in item:
+                        continue
+                    with self.subTest(version=version, item=item['id']):
+                        self.assertIn(item['icon'], self.notices.ICON_MEANINGS)
+                        if version in self.checked:
+                            self.assertNotIn(item['icon'], self.notices.GENERIC_ICONS)
+
+    def test_no_platform_sees_more_features_than_the_limit(self):
+        systems, installs = ('windows', 'macos', 'linux'), ('docker', 'standalone', 'source')
+        for version, entry in self.checked.items():
+            for tokens in ({system, install} for system in systems for install in installs):
+                shown = [item for item in entry.get('features', []) if self.notice.applies(item, tokens, {})]
+                with self.subTest(version=version, tokens=sorted(tokens)):
+                    self.assertLessEqual(len(shown), self.notices.FEATURE_LIMIT)
+
+    def test_automatic_items_only_show_where_the_upgrade_changed_data(self):
+        for version, entry in self.checked.items():
+            for item in entry.get('automatic', []):
+                with self.subTest(version=version, item=item['id']):
+                    self.assertIn(item.get('when'), self.notice.FACTS)

@@ -279,6 +279,23 @@ it('后台重算时隔一会儿再问，算完换上新结果就停', async () =
   expect(tasteGets(fetcher)).toHaveLength(2);
 });
 
+it('一直读到旧的就把间隔拉长：2、4、8 秒，算完就停', async () => {
+  vi.useFakeTimers();
+  const stale = payload({ stale: true });
+  const { fetcher } = await open({ taste: [stale, stale, stale, payload()] });
+  expect(tasteGets(fetcher)).toHaveLength(1);
+  await tick(STALE_POLL_MS);
+  expect(tasteGets(fetcher)).toHaveLength(2);
+  await tick(STALE_POLL_MS * 2 - 1);
+  expect(tasteGets(fetcher), '第二次还是旧的，等四秒').toHaveLength(2);
+  await tick(1);
+  expect(tasteGets(fetcher)).toHaveLength(3);
+  await tick(STALE_POLL_MS * 4);
+  expect(tasteGets(fetcher)).toHaveLength(4);
+  await tick(60_000);
+  expect(tasteGets(fetcher)).toHaveLength(4);
+});
+
 it('重算失败时不再轮询，提示条说明更新失败，「立即重试」让服务端跳过等待再算一次', async () => {
   vi.useFakeTimers();
   const failed = payload({ stale: true, error: '账本读取失败', computed_at: '2026-09-10T00:00:00Z' });

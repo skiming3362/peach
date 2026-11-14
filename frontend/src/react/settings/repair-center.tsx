@@ -19,7 +19,7 @@ import { Progress } from '../components/progress';
 import { StatusLabel, type StatusTone } from '../components/status-label';
 import { queryClient } from '../query';
 import {
-  fetchRepairs, REPAIRS_KEY, type RepairCenterData, type RepairHistory, type RepairItem,
+  fetchRepairs, localizeRepairs, REPAIRS_KEY, type RepairCenterData, type RepairHistory, type RepairItem,
 } from './repair-center-data';
 import { useAction } from './use-action';
 import { interfaceLanguage, t } from '../../i18n';
@@ -83,8 +83,8 @@ export function RepairCenterPage() {
   const data = query.data;
   const action = useAction();
   const update = (next: RepairCenterData) => queryClient.setQueryData(REPAIRS_KEY, next);
-  const post = (item: RepairItem, signal?: AbortSignal) => apiSend<RepairCenterData>(
-    `/api/configuration/repairs/${item.id}`, {}, 'POST', signal);
+  const post = async (item: RepairItem, signal?: AbortSignal) => localizeRepairs(await apiSend<RepairCenterData>(
+    `/api/configuration/repairs/${item.id}`, {}, 'POST', signal));
   const start = (item: RepairItem) => item.files === undefined
     ? void action.run(item.id, signal => post(item, signal), update)
     : void confirmModal({

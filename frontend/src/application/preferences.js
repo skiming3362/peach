@@ -4,6 +4,7 @@ import { buildBars, catalogState, dropOfflineFromDefaultLoc, homePath, loadCatal
 import { appSettingsStore } from './../appearance/settings';
 import { interfaceLanguage, storedInterfaceLanguage, t } from '../i18n';
 import { entityDisplayName, setNameLanguage } from '../core/entity-names';
+import { orientLabel } from '../core/stored-values';
 import { playUiSound, setUiSoundsEnabled, wireUiSounds } from '../ui-kit/sounds';
 import { applyTheme, watchSystemTheme } from './../appearance/theme';
 import { applyAccent, applyGlassFaces, applyHomeGlow, paintHomeGlowNow } from './../appearance/glow';
@@ -25,6 +26,7 @@ import { loadingState } from './loading.js';
 import { updateManagedRoute } from './../history/managed';
 import { MEDIA_SOURCE_ICONS, emptyStateHtml, wireHorizontalScroller } from '../ui-kit';
 import { tagLabel } from '../core/tags';
+import { codedText } from '../core/server-text';
 import { rereadPlaylists } from './playlists.js';
 import { receiptsState } from './receipts.js';
 import { dropBars } from './../catalog-bars';
@@ -63,13 +65,13 @@ export function sidebarDot(loc){
 }
 
 export function sidebarFacets(facetData,context){
-  const rows=(items,named=row=>row.label||tagLabel(row.k))=>(items||[]).map(row=>({value:String(row.k),label:named(row),n:row.n??null}));
+  const rows=(items,named=row=>codedText(row,'label')||tagLabel(row.k))=>(items||[]).map(row=>({value:String(row.k),label:named(row),n:row.n??null}));
   const creators=context.type==='entity'&&context.kind==='creator'
     ?(facetData.creators||[]).filter(row=>row.k!==context.name):facetData.creators;
   return {
     locations:(facetData.locations||[]).map(row=>({value:row.k,label:LOC[row.k]||row.k,n:row.n??null,dot:sidebarDot(row.k),
       ...(preferencesState.sourceOffline(row.k)?{offline:preferencesState.OFFLINE_HINT}:{})})),
-    regions:rows(facetData.regions),orientations:rows(facetData.orientations),years:rows(facetData.years),
+    regions:rows(facetData.regions),orientations:rows(facetData.orientations,row=>orientLabel(row.k)),years:rows(facetData.years),
     creators:rows(creators,row=>entityDisplayName('creator',row.k)),tags:rows(facetData.tags),tech:rows(facetData.tech),
     followTags:rows(facetData.follow_tags,row=>tagLabel(row.k)),
     duration:!!facetData.stats?.duration,

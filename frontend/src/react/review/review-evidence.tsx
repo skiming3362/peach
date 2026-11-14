@@ -5,7 +5,6 @@
 import { useEffect, useState } from 'react';
 import { RiExternalLinkLine, RiPlayLine } from '@remixicon/react';
 import { VisuallyHidden } from 'react-aria-components';
-import { spinnerHtml } from '@peach/legacy/ui';
 
 import { Button, ButtonLink } from '@/components/base/buttons/button';
 import { CheckboxGlyph } from '@/components/base/checkbox/checkbox-glyph';
@@ -35,9 +34,9 @@ function RequestedSourceImage({ source }: { source: string }) {
   }, [status]);
   return (
     <div className="relative flex h-review-image items-center justify-center overflow-hidden rounded-surface bg-background-secondary-default">
-      {status === 'loading' ? <span role="status" className="absolute flex items-center gap-2 text-body-2-regular text-text-secondary">
-        <span dangerouslySetInnerHTML={{ __html: spinnerHtml(t('manage:reviewEvidence.loadingImage')) }} />{t('manage:reviewEvidence.loadingImage')}
-      </span> : null}
+      {/* 等图是内容区首次取数：骨架铺满这一格，状态名只给辅助技术。 */}
+      {status === 'loading' ? <span role="status" aria-busy="true" aria-label={t('manage:reviewEvidence.loadingImage')} data-skeleton=""
+        className="absolute inset-0 skeleton-sheen" /> : null}
       {source && (status === 'loading' || status === 'ready')
         ? <img src={source} alt={t('manage:reviewEvidence.candidateImageAlt')} referrerPolicy="no-referrer" decoding="async"
             className={`size-full object-contain ${status === 'loading' ? 'invisible' : ''}`} onLoad={() => setStatus('ready')}

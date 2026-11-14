@@ -6,7 +6,8 @@ PR、issue、评论与提交说明都公开在 GitHub 上，编辑后旧版仍�
 其他贡献者）一律放行。
 
 PR、issue 与评论的读者是社区贡献者和用户：反馈汇总的条目编号、派单的批次号与轮次、
-本机交付流程的说法（工作树、`ready` 输出等）他们看不懂，见 `insider_terms`。这一项不看账本，
+「剩余模块」「最上层 PR」这类不说明指谁的相对说法、本机交付流程的说法（工作树、`ready` 输出等）
+他们看不懂，见 `insider_terms`。这一项不看账本，
 也不查提交说明——改工作树脚本的提交本来就要写工作树。
 
 确有必要时，在正文里写一行 `peach-public-text: <理由>` 放行。
@@ -26,12 +27,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(ROOT / "src"))
+from peach.interface_text import dev as t  # noqa: E402
+
 CODE = re.compile(r"(?<![A-Za-z0-9])([A-Za-z]{2,7})-?(\d{2,6})(?![0-9])")
 CJK = re.compile(r"[぀-ヿ㐀-鿿ｦ-ﾟ]{2,}")
 #: 标题片段按这么长的连续假名、汉字比对；短了会撞上普通用语。
 GRAM = 7
-#: 一段文字里达到这些数目才算「成串」；问题本身需要的一两个例子不拦。
-LIMITS = {"番号": 3, "人物": 2, "标题片段": 2}
+#: 一段文字里达到这些数目才算「成串」；问题本身需要的一两个例子不拦。给人看的类名见 `kind_label`。
+LIMITS = {"codes": 3, "names": 2, "titles": 2}
 WAIVER = re.compile(r"peach-public-text:\s*\S")
 #: 会把文字发到 GitHub 的 gh 子命令。
 PUBLISH = re.compile(r"\bgh\s+(?:(?:pr|issue)\s+(?:create|edit|comment)\b|release\s+(?:create|edit)\b"
@@ -39,17 +44,33 @@ PUBLISH = re.compile(r"\bgh\s+(?:(?:pr|issue)\s+(?:create|edit|comment)\b|releas
 BODY_FILE = re.compile(r"""(?:--body-file|--notes-file|-F)[=\s]+(?:body=@)?(?P<path>"[^"]+"|'[^']+'|[^\s"';|&]+)""")
 #: 反引号里的命令、标识照写，不算内部用语。
 CODE_SPAN = re.compile(r"```.*?```|`[^`\n]*`", re.S)
-#: 外部读者看不懂的内部用语，按类给出；改法见 `INSIDER_HINT`。钩子查的是整条命令（heredoc
+#: 外部读者看不懂的内部用语，按类给出；改法见 `insider_hint`。钩子查的是整条命令（heredoc
 #: 正文也在里面），所以不收脚本名：同一条命令里接着跑的 `agent_worktree.py integrate` 不是要发的文字。
+#: 「相对指代」只收搭配：「剩余空间」「其余显示英文」「这一批」「同批更新锁」是正常说法，不拦。
 INSIDER = {
-    "反馈条目编号": re.compile(r"(?<![A-Za-z0-9_/#.\-])(?:N\d{2,3}|R[0-2]\s*[–-]\s*R[0-2])(?![A-Za-z0-9])"),
-    "批次与轮次": re.compile(r"批次\s*[0-9]|第\s*[一二三四五六七八九十0-9]+\s*[批轮]|合批|首轮"),
-    "本机交付流程": re.compile(r"工作树|集成分支|主检出|派单|协调会话|已签发|按域"
+    "feedbackNumbers": re.compile(r"(?<![A-Za-z0-9_/#.\-])(?:N\d{2,3}|R[0-2]\s*[–-]\s*R[0-2])(?![A-Za-z0-9])"),
+    "batches": re.compile(r"批次\s*[0-9①-⑩]|第\s*(?:[一二三四五六七八九十0-9]+|[①-⑩][a-z]?)\s*[批轮]|合批|首轮"),
+    "relativeReferences": re.compile(r"(?:剩余|剩下的?|其余)的?(?:模块|文案|页面组|PR|分支|几批|影响面|路由|回归|分片)|剩余文字"
+                       r"|前几批|另起一批|本批(?:的|改动|范围|集成)|同批\s*(?:PR|检查|修|交付|重跑|集成|验收)"
+                       r"|(?:媒体|集成|本机)批次|此批|最上层\s*的?\s*PR|叠在(?:它|这个?\s*PR)上面"
+                       r"|(?:用户|维护者)本轮|本轮(?:组合|固定组合|集成|已验证|未实测|实际|先)|上轮主线|[两几]轮主线"
+                       r"|固定组合|组合分支|(?:发布|本次)收口"),
+    "localDelivery": re.compile(r"工作树|集成分支|主检出|派单|协调会话|协调者|子代理|已签发|按域"
                          r"|\b(?:ready|integrate|preflight)\s*[:：(（]"),
-    "自造用语": re.compile(r"门槛|本机提交者|账本副本|真相字段|升级后存量"),
+    "coinedTerms": re.compile(r"门槛|本机提交者|账本副本|真相字段|升级后存量|延后清单"
+                       r"|(?:中文|复杂度|主线|旧|独立|上游|最终)基线|以\S{0,16}为基线|基线(?:失败|复核|审阅|检出)"
+                       r"|基线\s*[0-9a-f]{7,40}"),
 }
-INSIDER_HINT = ("编号与批次号删掉、直接写问题本身；测试结果只写测试命令、范围和结果；"
-                "门槛写「检查」，账本副本写「账本备份」，升级后存量写「对已有数据的影响」")
+
+
+def insider_hint() -> str:
+    """内部用语的改法；钩子与 `agent_worktree.py integrate` 的拒收说明都接上这一句。"""
+    return t("check_public_text.insiderHint")
+
+
+def kind_label(kind: str) -> str:
+    """`LIMITS` 与 `INSIDER` 的类名给人看的写法。"""
+    return t(f"check_public_text.kind.{kind}")
 
 
 def code_key(prefix: str, digits: str) -> str:
@@ -84,19 +105,19 @@ class Library:
         return library
 
     def findings(self, text: str) -> dict[str, list[str]]:
-        found: dict[str, set[str]] = {"番号": set(), "人物": set(), "标题片段": set()}
+        found: dict[str, set[str]] = {"codes": set(), "names": set(), "titles": set()}
         for match in CODE.finditer(text):
             if code_key(*match.groups()) in self.codes:
-                found["番号"].add(match.group(0).upper())
+                found["codes"].add(match.group(0).upper())
         for name in self.names:
             if name.isascii():
                 if len(name) >= 5 and re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", text):
-                    found["人物"].add(name)
+                    found["names"].add(name)
             elif name in text:
-                found["人物"].add(name)
+                found["names"].add(name)
         for run in CJK.findall(text):
             if any(run[i:i + GRAM] in self.grams for i in range(len(run) - GRAM + 1)):
-                found["标题片段"].add(run)
+                found["titles"].add(run)
         return {kind: sorted(values) for kind, values in found.items() if values}
 
 
@@ -105,7 +126,8 @@ def problems(text: str, library: Library | None) -> list[str]:
     if library is None or WAIVER.search(text):
         return []
     found = library.findings(text)
-    return [f"{kind} {len(values)} 个：" + "、".join(values[:8]) + ("……" if len(values) > 8 else "")
+    return [t("check_public_text.libraryFinding", kind=kind_label(kind), count=len(values), values=values[:8],
+              more=t("check_public_text.more") if len(values) > 8 else "")
             for kind, values in found.items() if len(values) >= LIMITS[kind]]
 
 
@@ -118,7 +140,8 @@ def insider_terms(text: str) -> list[str]:
     for kind, pattern in INSIDER.items():
         terms = sorted({match.group(0).strip() for match in pattern.finditer(plain)})
         if terms:
-            found.append(f"{kind}：" + "、".join(terms[:6]) + ("……" if len(terms) > 6 else ""))
+            found.append(t("check_public_text.insiderFinding", kind=kind_label(kind), terms=terms[:6],
+                           more=t("check_public_text.more") if len(terms) > 6 else ""))
     return found
 
 
@@ -169,21 +192,21 @@ def hook(payload: dict) -> int:
         return 0
     found, insider = problems(text, load_library(cwd)), insider_terms(text)
     if found:
-        print("这次要发到 GitHub 的文字成串列出了本机账本里的馆藏细节（" + "；".join(found) + "）。"
-              "按 peach-issue-delivery：规则效果写类型和定性结论，只留问题本身需要的一两个例子。", file=sys.stderr)
+        print(t("check_public_text.hookLibrary", findings=t("common.clauseSeparator").join(found)), file=sys.stderr)
     if insider:
-        print("这次要发到 GitHub 的文字用了外部读者看不懂的内部用语（" + "；".join(insider) + "）。"
-              + INSIDER_HINT + "。", file=sys.stderr)
+        print(t("check_public_text.hookInsider", findings=t("common.clauseSeparator").join(insider),
+                hint=insider_hint()), file=sys.stderr)
     if found or insider:
-        print("确有必要保留时，正文加一行 `peach-public-text: <理由>`。", file=sys.stderr)
+        print(t("check_public_text.hookWaiver"), file=sys.stderr)
         return 2
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("files", nargs="*", help="要检查的文件，`-` 读 stdin")
-    parser.add_argument("--hook-event", action="store_true", help="从 stdin 收 PreToolUse 钩子 JSON")
+    parser = argparse.ArgumentParser(description=t("check_public_text.description"),
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("files", nargs="*", help=t("check_public_text.filesHelp"))
+    parser.add_argument("--hook-event", action="store_true", help=t("check_public_text.hookEventHelp"))
     args = parser.parse_args(argv)
     if args.hook_event:
         try:
@@ -193,7 +216,7 @@ def main(argv: list[str] | None = None) -> int:
         return hook(payload if isinstance(payload, dict) else {})
     library = load_library(ROOT)
     if library is None:
-        print("没有找到本机账本，只查内部用语")
+        print(t("check_public_text.noLedger"))
     failed = False
     for name in args.files or ["-"]:
         text = sys.stdin.read() if name == "-" else Path(name).read_text(encoding="utf-8")

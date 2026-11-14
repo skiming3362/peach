@@ -15,7 +15,7 @@ import { apiGet } from '../../api';
 import { ArtSlot } from '../components/art-slot';
 import { useLibraryTints } from '../components/library-tint';
 import { catalogListSkeletonCellHtml } from '../../catalog-content-skeleton';
-import { identityParts } from '../components/media-card';
+import { editionNames, identityParts } from '../components/media-card';
 import { useEntityNames } from '../use-entity-names';
 import { SourceMark } from '../settings/section';
 import { DataTableFrame } from '../components/data-table-frame';
@@ -31,6 +31,7 @@ import { CatalogRating, catalogTableDate } from './catalog-table-controls';
 import { TableColumnControls, TableColumnResizer } from '../components/table-column-controls';
 import { TableSelectionHeader } from '../components/table-selection-header';
 import { joinList, t } from '../../i18n';
+import { codedText } from '../../core/server-text';
 import './catalog-list.css';
 
 const features = tableFeatures({ rowSortingFeature, rowSelectionFeature, rowPaginationFeature, columnVisibilityFeature });
@@ -235,7 +236,7 @@ function ListIdentity({ item, props, disabled }: { item: MediaItem; props: Catal
   /* 与卡片同一判据：按画幅筛时组里只剩这一卷或这一个版本，就按单个文件写。 */
   const parts = Number(item.part_group?.count) > 1 ? item.part_group || null : null;
   const editions = Number(item.edition_group?.count) > 1 ? item.edition_group || null : null;
-  const rawName = parts?.title || item.name || '';
+  const rawName = (parts ? codedText(parts, 'title') : '') || item.name || '';
   const name = props.helpers.displayName(item, rawName).trim() || t('catalog:catalogList.untitled');
   const titleHtml = props.helpers.titleHtml(item, rawName).trim() || t('catalog:catalogList.untitled');
   useEntityNames();
@@ -255,7 +256,7 @@ function ListIdentity({ item, props, disabled }: { item: MediaItem; props: Catal
       <span data-list-picture="">{artwork.html
         ? <ArtSlot artwork={artwork} relayout={root => relayoutCovers(root, 'small')} /> : <span>{t('catalog:catalogList.noPreview')}</span>}
         {parts && !editions ? <span data-media-group="">{t('catalog:catalogList.partCount', { count: Number(parts.count) })}</span> : null}
-        {editions ? <span data-media-group="" title={editions.editions.join(' · ')}>{t('catalog:catalogList.editionCount', { count: Number(editions.count) })}</span> : null}
+        {editions ? <span data-media-group="" title={editionNames(editions)}>{t('catalog:catalogList.editionCount', { count: Number(editions.count) })}</span> : null}
         {watched > 0
           ? <span data-media-progress="" role="progressbar" aria-label={t('catalog:catalogList.watchProgress')} aria-valuemin={0} aria-valuemax={100}
             aria-valuenow={Math.round(watched * 100)}>

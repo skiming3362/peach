@@ -39,12 +39,13 @@ const apple = { glyph: RiAppleFill, brand: 'apple' };
 const android = { glyph: RiAndroidFill, brand: 'android' };
 type Platform = { glyph: Glyph; brand: string } | { browser: string };
 
-/** 服务端 `device_name()` 写出的系统词 → 平台标志与终端形态。没有 Linux 通用标志，只给终端图标。 */
-const SYSTEMS: Record<string, { platform?: Platform; terminal: Glyph }> = {
+/** 服务端 `device_name()` 写出的系统词 → 平台标志与终端形态；不是专名的系统词（安卓平板）按界面语言写。
+ *  没有 Linux 通用标志，只给终端图标。 */
+const SYSTEMS: Record<string, { platform?: Platform; terminal: Glyph; label?: () => string }> = {
   iPhone: { platform: apple, terminal: RiSmartphoneLine },
   iPad: { platform: apple, terminal: RiTabletLine },
   Android: { platform: android, terminal: RiSmartphoneLine },
-  'Android 平板': { platform: android, terminal: RiTabletLine },
+  'Android tablet': { platform: android, terminal: RiTabletLine, label: () => t('settings:deviceSessions.androidTablet') },
   ChromeOS: { platform: { browser: 'chrome' }, terminal: RiComputerLine },
   Windows: { platform: { glyph: RiWindowsFill, brand: 'windows' }, terminal: RiComputerLine },
   macOS: { platform: apple, terminal: RiComputerLine },
@@ -70,7 +71,7 @@ function DeviceLabel({ row }: { row: DeviceSession }) {
     <>
       {browser ? <>{browserIconId(browser) ? <BrowserIcon name={browser} className={MARK} /> : null}{browser}</> : null}
       {browser && system ? ' · ' : null}
-      {system ? <>{platform ? <PlatformMark platform={platform} /> : null}{system}</> : null}
+      {system ? <>{platform ? <PlatformMark platform={platform} /> : null}{SYSTEMS[system]!.label?.() ?? system}</> : null}
     </>
   );
 }

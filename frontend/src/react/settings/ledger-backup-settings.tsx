@@ -11,14 +11,19 @@ import { SettingsRow } from '@/components/application/settings/settings-rows';
 import { Button } from '@/components/base/buttons/button';
 
 import { apiGet, apiSend } from '../../api';
-import { LoadingDots } from '../components/loading-dots';
-import { Progress } from '../components/progress';
-import { ErrorText, Footer, Help, Rows, Section, Stack, TaskCenterLink } from './section';
+import { TaskProgress } from '../components/task-progress';
+import { activityKind } from '../../activity-kinds';
+import { ledgerBackupsSkeleton } from '../../configuration-skeleton';
+import { ErrorText, Footer, Help, Rows, Section, SectionSkeleton, Stack, TaskCenterLink } from './section';
 import { busyProps, useAction } from './use-action';
-import { t } from '../../i18n';
+import { codedText, jobText, serverLabel, stageText } from '../../core/server-text';
+import { pollUntil } from '../../polling';
+import { interfaceLanguage, t } from '../../i18n';
 
 export const LEDGER_BACKUPS_URL = '/api/configuration/ledger-backups';
 const POLL_MS = 1500;
+/** 一轮备份或恢复最多跟这么久；更久的看任务中心。 */
+const POLL_LIMIT_MS = 60 * 60_000;
 
 export interface LedgerBackup {
   id: string;
@@ -27,11 +32,14 @@ export interface LedgerBackup {
   modified_at: number;
   source: 'manual' | 'auto';
   purpose: string;
+  /** 用途的 id，按它取译文；没有译文时显示 `purpose`。 */
+  purpose_code?: string;
 }
 
 export interface LedgerBackupJob {
   status: 'idle' | 'running' | 'complete' | 'failed' | 'cancelled';
   stage?: string;
+  stage_code?: string;
   done?: number;
   total?: number;
   error?: string;
@@ -48,20 +56,17 @@ export interface LedgerBackupState {
   last_restore: { state: 'interrupted' | 'failed'; outcome: string; message: string; finished_at: number } | null;
 }
 
-const when = (backup: LedgerBackup) => new Date(backup.modified_at * 1000).toLocaleString();
+const when = (backup: LedgerBackup) => new Date(backup.modified_at * 1000).toLocaleString(interfaceLanguage);
 
 function describe(backup: LedgerBackup) {
-  return [backup.source === 'manual' ? t('settings:databaseBackups.manual') : t('settings:databaseBackups.automatic', { purpose: backup.purpose }), fmtSize(backup.bytes)].join(' · ');
+  return [backup.source === 'manual' ? t('settings:databaseBackups.manual') : t('settings:databaseBackups.automatic', { purpose: serverLabel(`ledgerBackup.purpose.${backup.purpose_code}`, backup.purpose) }), fmtSize(backup.bytes)].join(' · ');
 }
 
-/** 进行中的那一个任务：知道页数就画进度条，否则只说在做哪一步。 */
-function Running({ job, label }: { job: LedgerBackupJob; label: string }) {
+/** 进行中的那一个任务：知道页数就画进度条，否则画写入动画；说明写当前那一步。 */
+function Running({ job, task, label }: { job: LedgerBackupJob; task: 'ledger-backup' | 'ledger-restore'; label: string }) {
   return (
     <div aria-live="polite" className="flex flex-col gap-2">
-      {job.total
-        ? <Progress label={label} value={job.done || 0} max={job.total} />
-        : <LoadingDots label={label} />}
-      <Help>{job.stage || label}</Help>
+      <TaskProgress embedded kind={activityKind(task, job.stage_code)} label={[label, stageText(job)].filter(Boolean).join(' · ')} value={job.done || 0} total={job.total} />
       <TaskCenterLink />
     </div>
   );
@@ -83,16 +88,18 @@ export function LedgerBackupSettings({ receipt }: { receipt(message: string): vo
     return () => controller.abort();
   }, []);
 
+  /* 有一轮在跑时 1.5 秒读一次，读失败退避，页面不可见时暂停，跑满上限就停。 */
   useEffect(() => {
     if (!running) return;
     const controller = new AbortController();
-    const timer = setTimeout(() => {
-      apiGet<LedgerBackupState>(LEDGER_BACKUPS_URL, controller.signal).then(setState, () => {
-        if (!controller.signal.aborted) setState((current) => current && { ...current });
-      });
-    }, POLL_MS);
-    return () => { controller.abort(); clearTimeout(timer); };
-  }, [state]);
+    void pollUntil({
+      signal: controller.signal, everyMs: POLL_MS, limitMs: POLL_LIMIT_MS,
+      read: (signal) => apiGet<LedgerBackupState>(LEDGER_BACKUPS_URL, signal),
+      apply: setState,
+      done: (next) => next.backup.status !== 'running' && next.restore.status !== 'running',
+    });
+    return () => controller.abort();
+  }, [running]);
 
   // 一轮结束：成功的回执走 Toast，失败的原因留在分区里。只报这一页上看着开始的那一轮。
   useEffect(() => {
@@ -109,10 +116,12 @@ export function LedgerBackupSettings({ receipt }: { receipt(message: string): vo
     }
   }, [state]);
 
+  /* 首次读取：骨架按最终结构占住说明、备份行与底栏。 */
+  if (!state && !loadError) return <SectionSkeleton label={t('settings:databaseBackups.loading')} html={ledgerBackupsSkeleton} />;
   if (!state) {
     return (
       <Section id="ledgerBackups" guide="ledger-backups" title={t('settings:databaseBackups.title')}>
-        <Stack>{loadError ? <ErrorText>{loadError}</ErrorText> : <LoadingDots label={t('settings:databaseBackups.loading')} />}</Stack>
+        <Stack><ErrorText>{loadError}</ErrorText></Stack>
       </Section>
     );
   }
@@ -139,12 +148,12 @@ export function LedgerBackupSettings({ receipt }: { receipt(message: string): vo
     <Section id="ledgerBackups" guide="ledger-backups" title={t('settings:databaseBackups.title')}>
       <Stack>
         <Help>{t('settings:databaseBackups.help')}</Help>
-        {!state.writer ? <Help>{t('settings:databaseBackups.notPrimary')}{state.writer_reason}</Help> : null}
-        {backingUp ? <Running job={state.backup} label={t('settings:databaseBackups.backupProgress')} /> : null}
-        {restoring ? <Running job={state.restore} label={t('settings:databaseBackups.restoreProgress')} /> : null}
-        {failed ? <ErrorText>{failed.error || t('settings:databaseBackups.jobIncomplete')}</ErrorText> : null}
+        {!state.writer ? <Help>{t('settings:databaseBackups.notPrimary')}{codedText(state, 'writer_reason')}</Help> : null}
+        {backingUp ? <Running job={state.backup} task="ledger-backup" label={t('settings:databaseBackups.backupProgress')} /> : null}
+        {restoring ? <Running job={state.restore} task="ledger-restore" label={t('settings:databaseBackups.restoreProgress')} /> : null}
+        {failed ? <ErrorText>{jobText(failed, 'error') || t('settings:databaseBackups.jobIncomplete')}</ErrorText> : null}
         {last ? (last.outcome === 'kept' || last.outcome === 'completed'
-          ? <Help>{last.message}</Help> : <ErrorText>{last.message}</ErrorText>) : null}
+          ? <Help>{codedText(last, 'message')}</Help> : <ErrorText>{codedText(last, 'message')}</ErrorText>) : null}
         {action.error ? <ErrorText>{action.error}</ErrorText> : null}
       </Stack>
       {state.backups.length

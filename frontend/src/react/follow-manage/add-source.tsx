@@ -22,9 +22,10 @@ import { cx } from '@/utils/cx';
 import { errorMessage } from '../../api';
 import { useBackgroundJob } from '../background-job';
 import { cardClass } from '../components/card';
-import { LoadingDots } from '../components/loading-dots';
+import { ActivityStatus } from '../components/activity-motion';
 import { Note } from '../components/note';
 import { TaskProgress } from '../components/task-progress';
+import { activityKind } from '../../activity-kinds';
 import { SelectionPopover } from '../components/selection-popover';
 import { busyProps } from '../settings/use-action';
 import { ExternalLink, FieldLabel, Help } from '../settings/section';
@@ -35,6 +36,7 @@ import {
 } from './follow-manage';
 import { SourceIcon } from './source-view';
 import { composingKey } from '../components/ime';
+import { codedText, jobText, serverLabel } from '../../core/server-text';
 import { joinList, t } from '../../i18n';
 
 const MENU_ROW = cx(MENU_ITEM, MENU_ITEM_INTERACTIVE, 'text-body-2-medium');
@@ -89,7 +91,7 @@ function SuggestMenu(
       placement="bottom start" offset={4} aria-label={t('follow:addCreatorSource.suggestions')}
       className={cx(MENU_POPOVER_SURFACE, 'flex w-(--trigger-width) flex-col gap-1 overscroll-contain')}>
       {busy && !options.length
-        ? <div className="px-2 py-1.5"><LoadingDots label={t('follow:addCreatorSource.findingSuggestions')} /></div>
+        ? <div className="px-2 py-1.5"><ActivityStatus kind="radar" label={t('follow:addCreatorSource.findingSuggestions')} /></div>
         : null}
       {options.map((option, at) => (
         <Fragment key={`${option.group}-${option.value}`}>
@@ -156,7 +158,7 @@ function PickRow(
   },
 ) {
   if (row.kind === 'error') {
-    return <Note tone="error" title={row.line}>{row.error || t('follow:addCreatorSource.searchFailed')}</Note>;
+    return <Note tone="error" title={row.line}>{jobText(row, 'error') || t('follow:addCreatorSource.searchFailed')}</Note>;
   }
   const candidates = (row.candidates || []).filter(
     (candidate) => !hidden.has(candidate.provider_label || ''));
@@ -172,9 +174,9 @@ function PickRow(
             <span className="flex min-w-0 flex-wrap items-center gap-1.5">
               <SourceIcon provider={candidate.provider} />
               <b className="text-body-medium">{candidate.provider_label}</b>
-              <span className="min-w-0 break-words">{candidate.label}</span>
+              <span className="min-w-0 break-words">{codedText(candidate, 'label')}</span>
               <small className="text-caption-1-regular text-text-secondary">
-                {candidate.known ? t('follow:addCreatorSource.alreadyFollowing') : candidate.evidence}
+                {candidate.known ? t('follow:addCreatorSource.alreadyFollowing') : codedText(candidate, 'evidence')}
               </small>
             </span>
           </Checkbox>
@@ -182,13 +184,14 @@ function PickRow(
       }) : <Help>{NO_CANDIDATE}</Help>}
       {(row.external_searches || []).map((search) => (
         <div key={search.url} className="flex flex-wrap items-center gap-2">
-          <small className="text-caption-1-regular text-text-secondary">{search.evidence}</small>
+          <small className="text-caption-1-regular text-text-secondary">{codedText(search, 'evidence')}</small>
           {/* 这一条会离开 Peach，所以带外链标；标由共用的 `ExternalLink` 给，全站一个写法。 */}
-          <ExternalLink href={search.url}>{t('follow:shared.labeled', { label: search.label, value: search.query })}</ExternalLink>
+          <ExternalLink href={search.url}>{t('follow:shared.labeled', { label: codedText(search, 'label'), value: search.query })}</ExternalLink>
         </div>
       ))}
       {failures.length ? (
-        <Help>{joinList(failures.map(([name, reason]) => t('follow:shared.labeled', { label: name, value: reason })))}</Help>
+        <Help>{joinList(failures.map(([name, reason]) => t('follow:shared.labeled', {
+          label: name, value: serverLabel(row.failure_codes?.[name]?.code ?? '', reason, row.failure_codes?.[name]?.params) })))}</Help>
       ) : null}
     </div>
   );
@@ -228,7 +231,7 @@ export function AddSource({ data, credentials, readOnly, toast }: AddSourceProps
 
   const options = useMemo<SuggestOption[]>(() => (suggest.data?.groups || []).flatMap((group) => (
     group.items.map((item) => ({
-      value: item.value, matched: item.matched || '', n: item.n || 0, group: group.label,
+      value: item.value, matched: serverLabel(item.matched_code ?? '', item.matched || ''), n: item.n || 0, group: serverLabel(group.label_code ?? '', group.label),
     }))
   )), [suggest.data]);
 
@@ -239,7 +242,7 @@ export function AddSource({ data, credentials, readOnly, toast }: AddSourceProps
     onStarted: () => setUnpicked(new Set()),
     onError: (cause) => setProblem(errorMessage(cause)),
     onFinish: (state) => {
-      if (state.status === 'failed') setProblem(state.error || t('follow:addCreatorSource.searchFailed'));
+      if (state.status === 'failed') setProblem(jobText(state, 'error') || t('follow:addCreatorSource.searchFailed'));
     },
   });
 
@@ -352,8 +355,8 @@ export function AddSource({ data, credentials, readOnly, toast }: AddSourceProps
       </div>
 
       <div aria-live="polite" className="flex flex-col gap-3 empty:hidden">
-        {running || resolve.isPending ? <TaskProgress embedded
-          label={job?.message || (job?.total ? t('follow:addCreatorSource.searchProgress', { checked: job.checked || 0, count: job.total }) : byName ? BY_NAME_HINT : BY_LINK_HINT)}
+        {running || resolve.isPending ? <TaskProgress embedded kind={activityKind('follow-resolve')}
+          label={jobText(job) || (job?.total ? t('follow:addCreatorSource.searchProgress', { checked: job.checked || 0, count: job.total }) : byName ? BY_NAME_HINT : BY_LINK_HINT)}
           value={job?.checked} total={job?.total} /> : null}
         {problem ? <Note tone="error" title={t('follow:addJavFeed.notCompleted')}>{problem}</Note> : null}
       </div>

@@ -28,6 +28,7 @@ import { CodeBlock } from '../components/code-block';
 import { Note } from '../components/note';
 import { Disclosure, ErrorText, FieldLabel, Footer, Help, Rows, Section, Stack } from './section';
 import { busyProps, useAction } from './use-action';
+import { codedText } from '../../core/server-text';
 import { joinList, t } from '../../i18n';
 
 const SAVE_URL = '/api/configuration/push-discovery';
@@ -78,7 +79,7 @@ export function PushDiscoveryForm({ initial, receipt }: {
     live.queue.pending ? t('settings:pushDiscovery.pendingCount', { count: live.queue.pending }) : '',
   ].filter(Boolean).join(t('shell:format.clauseSeparator'));
   const watching = live.local_running
-    ? t('settings:pushDiscovery.monitoring', { paths: joinList(live.local_roots) }) : live.local_message || t('settings:pushDiscovery.notRunningDetail');
+    ? t('settings:pushDiscovery.monitoring', { paths: joinList(live.local_roots) }) : (live.local_message ? codedText(live, 'local_message') : '') || t('settings:pushDiscovery.notRunningDetail');
 
   return (
     <Section id="pushDiscovery" guide="discovery" title={t('settings:fileDiscovery.title')} onSubmit={submit}>

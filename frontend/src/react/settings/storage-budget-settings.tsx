@@ -8,6 +8,7 @@ import { apiGet, apiSend, errorMessage } from '../../api';
 import type { StoragePolicy, StorageState } from '../bundle';
 import { ErrorText, Footer, Help, Rows, Section, Stack } from './section';
 import { busyProps, useAction } from './use-action';
+import { codedText, serverLabelList } from '../../core/server-text';
 import { t } from '../../i18n';
 
 const NUMBERS = [
@@ -16,13 +17,19 @@ const NUMBERS = [
   ['cache_max_gib', t('settings:storageLimits.cacheLimit'), t('settings:storageLimits.cacheLimitHelp')],
 ] as const;
 
+type LastCheck = NonNullable<NonNullable<StorageState['budget']>['last_check']>;
+/** 触线原因按当前界面语言：`reason_codes` 与 `reasons` 同序，缺 code 的照原文。 */
+const reasonTexts = (check: LastCheck) =>
+  serverLabelList(check.reasons, check.reason_codes?.map(item => item?.code ?? null),
+    check.reason_codes?.map(item => item?.params ?? null));
+
 export function StorageBudgetSettings({ initial, after, receipt }: {
   initial: NonNullable<StorageState['budget']>;
   after(storage: StorageState): void;
   receipt(message: string): void;
 }) {
   const [policy, setPolicy] = useState(initial.policy);
-  const action = useAction(initial.error);
+  const action = useAction(codedText(initial, 'error'));
   const [cacheRead, setCacheRead] = useState('');
   useEffect(() => {
     if (!policy?.enabled || initial.policy?.external_cache_path) return;
@@ -85,7 +92,7 @@ export function StorageBudgetSettings({ initial, after, receipt }: {
     </Rows> : null}
     <Stack divided>
       {policy.enabled ? <Help>{t('settings:storageLimits.limitsHelp')}</Help> : null}
-      {policy.enabled && check?.paused ? <ErrorText>{t('settings:storageLimits.pausedWithReasons', { reasons: check.reasons.join('；') })}</ErrorText> : null}
+      {policy.enabled && check?.paused ? <ErrorText>{t('settings:storageLimits.pausedWithReasons', { reasons: reasonTexts(check).join(t('shell:format.semicolonSeparator')) })}</ErrorText> : null}
       {action.error ? <ErrorText>{action.error}</ErrorText> : null}
     </Stack>
     <Footer><Button type="submit" {...busyProps(action.busy === 'save')}>{t('settings:shared.saveSettings')}</Button></Footer>

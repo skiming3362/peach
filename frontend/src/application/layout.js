@@ -12,6 +12,7 @@ import { hideDiscoveryBars } from './loading.js';
 import { releaseManagedRoute } from './../history/managed';
 import { isFeedNewPath } from './feed.js';
 import { tagLabel } from '../core/tags';
+import { PORTRAIT } from '../core/stored-values';
 import { followFeedLive, followState, followView, followViewPath, routeFollowFeed } from './follow.js';
 import { applicationEffects } from './effects';
 import { entityJavLayout, notifyShell, pageOpens, runtimeConfigurable, selectMode, selectSurface, state, writeShell } from './../shell/index';
@@ -360,14 +361,14 @@ export function navOn(k){
   }
   // JAV 分区及馆藏 JAV 筛选共用导航状态；竖屏由内存里的筛选开关判定。
   if(k==='jav')return path==='/jav'||javActive();
-  if(k==='shorts')return state.orient==='竖屏'; // i18n-exempt: 竖屏是地址参数与状态值
+  if(k==='shorts')return state.orient===PORTRAIT;
   // 首页只在真的停在首页列表上时亮：管理区、索引页、实体页都不算，
   // 否则它会和当前所在的入口同时高亮。
-  if(k==='')return path==='/'&&!manageSection()&&!state.state&&!javActive()&&state.orient!=='竖屏'; // i18n-exempt: 竖屏是地址参数与状态值
+  if(k==='')return path==='/'&&!manageSection()&&!state.state&&!javActive()&&state.orient!==PORTRAIT;
   // 目录页的四个筛选态共用一屏，竖屏是压在它们之上的另一层筛选。
-  if(STATE_ROUTES[k])return nav===k&&state.orient!=='竖屏'; // i18n-exempt: 竖屏是地址参数与状态值
+  if(STATE_ROUTES[k])return nav===k&&state.orient!==PORTRAIT;
   if(nav)return nav===k;
-  return path==='/'&&state.state===k&&state.orient!=='竖屏'; // i18n-exempt: 竖屏是地址参数与状态值
+  return path==='/'&&state.state===k&&state.orient!==PORTRAIT;
 }
 
 export function navTo(k){
@@ -386,7 +387,7 @@ export function navTo(k){
   // 有自己路径的入口（追更、播放列表、沉浸模式、索引页）按路由元数据的 `nav` 找路径进。
   const path=STATE_ROUTES[k]?null:navigationState.routePathOf('nav',k);
   if(path){navigationState.openRoutePath(path);return}
-  if(k==='shorts'){state.orient='竖屏';state.state=''}else{state.orient='';state.state=k} // i18n-exempt: 竖屏是地址参数与状态值
+  if(k==='shorts'){state.orient=PORTRAIT;state.state=''}else{state.orient='';state.state=k}
   notifyShell();
   navigationState.route(homePath());
   syncNavigation();buildBars();

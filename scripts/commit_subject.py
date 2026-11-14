@@ -3,10 +3,18 @@
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 
-from . import co_author
-from .check_readme_impact import git, unpublished
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+SRC_DIR = PROJECT_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from peach.interface_text import dev as t  # noqa: E402
+
+from . import co_author  # noqa: E402
+from .check_readme_impact import git, unpublished  # noqa: E402
 
 #: 允许的提交类型，封闭清单。前三个进变更日志（`scripts/changelog.py` 的 TYPE_GROUPS），
 #: 其余只改开发过程。要加新类型先想清它属于哪一组，不是随手起个词。
@@ -43,8 +51,8 @@ def check(repo: Path, base: str, head: str = "HEAD") -> list[str]:
     for subject in subjects(repo, base, head):
         parsed = FORM.match(subject)
         if parsed is None:
-            problems.append(f"提交主题「{subject}」须为 type(scope): 描述，如 {EXAMPLE}")
+            problems.append(t("commit_subject.badForm", subject=subject, example=EXAMPLE))
         elif parsed["type"] not in TYPES:
-            problems.append(f"提交主题「{subject}」的类型「{parsed['type']}」不在清单，"
-                            "允许：" + "、".join(sorted(TYPES)))
+            problems.append(t("commit_subject.unknownType", subject=subject, type=parsed["type"],
+                              allowed=sorted(TYPES)))
     return problems

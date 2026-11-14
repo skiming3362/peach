@@ -11,7 +11,7 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing, redirect_stdout
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from peach import scan, wants
@@ -187,7 +187,7 @@ class ReconcileTests(WantFixture):
                 "--db", str(self.db), "--logo-root", str(self.root / "logos"),
                 "--source", wants.AUTO_SOURCE, "--batch", planned[0]["acquired_batch"],
                 "--apply", "--backup", str(self.root / "backup.db")]), 0)
-        self.assertIn("'想要回到待找': 2", printed.getvalue())
+        self.assertIn("'reopened_wants': 2", printed.getvalue())
         self.assertEqual(self.query(
             "SELECT code,state,search_count,acquired_asset_id,acquired_batch FROM want_item ORDER BY id"),
             [("SSIS-950", "wanted", 0, None, None), ("SSIS-951", "given_up", 3, None, None)])
@@ -252,6 +252,28 @@ class SearchStateTests(WantFixture):
         self.assertEqual([target.fresh for target in targets], [True, True, False])
         self.assertEqual((targets[1].code, targets[1].follow_url),
                          (None, "https://rule34video.com/video/9/x/"))
+
+    def test_due_targets_space_searches_by_age_and_last_outcome(self):
+        now = datetime(2026, 10, 1, 12, tzinfo=timezone.utc)
+
+        def searched(want_id, outcome, hours_ago):
+            self.write(lambda connection: connection.execute(
+                "UPDATE want_item SET last_search_at=?,last_search_outcome=? WHERE id=?",
+                (wants.stamp(now - timedelta(hours=hours_ago)), outcome, want_id)))
+        never = self.want("ABP-120", "2025-01-01")
+        fresh_today, fresh_yesterday = self.want("ABP-121", "2026-09-15"), self.want("ABP-122", "2026-09-15")
+        old_this_week, old_last_week = self.want("ABP-123", "2025-01-01"), self.want("ABP-124", "2025-01-01")
+        failed = self.want("ABP-125", "2025-01-01")
+        searched(fresh_today, "none", 3)
+        searched(fresh_yesterday, "none", 25)
+        searched(old_this_week, "none", 24 * 6)
+        searched(old_last_week, "found", 24 * 7)
+        searched(failed, "error", 7)
+        self.add_follow_item()
+        self.write(lambda connection: wants.add_follow(connection, 9))
+        with closing(sqlite3.connect(self.db)) as connection:
+            due = wants.due_targets(connection, now=now, today=TODAY)
+        self.assertEqual([target.id for target in due], [never, fresh_yesterday, old_last_week, failed])
 
     def test_the_list_carries_the_follow_provider(self):
         self.add_follow_item()

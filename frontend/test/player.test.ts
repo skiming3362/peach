@@ -453,7 +453,7 @@ describe('画中画的快进快退', () => {
 });
 
 describe('外挂字幕', () => {
-  it('能播的轨全挂上，一条都不预先打开', async () => {
+  it('能播的轨全挂上，一条都不预先打开；认出语言的按语言码说语言名', async () => {
     stubFetch(() => ({ subtitles: [
       { id: 'sidecar:1', playable: true, src: '/sub/1.vtt', language: 'zh', label: '简体' },
       { id: 'sidecar:2', playable: false, src: '/sub/2.ass', language: 'ja', label: '日语' },
@@ -463,7 +463,8 @@ describe('外挂字幕', () => {
     mountPlayerSubtitles(player, 21);
     await flush(); await flush();
     expect(raw.addRemoteTextTrack.mock.calls).toEqual([
-      [{ id: 'sidecar:1', kind: 'subtitles', src: '/sub/1.vtt', srclang: 'zh', label: '简体', default: false }, true],
+      [{ id: 'sidecar:1', kind: 'subtitles', src: '/sub/1.vtt', srclang: 'zh',
+        label: new Intl.DisplayNames(['zh-CN'], { type: 'language' }).of('zh'), default: false }, true],
       [{ id: 'sidecar:3', kind: 'subtitles', src: '/sub/3.vtt', srclang: '', label: '繁体', default: false }, true],
     ]);
   });

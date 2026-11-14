@@ -17,7 +17,7 @@ const FAMILIES: [Icon, string[]][] = [
   [RiUser3Line, ['performer-profile', 'performer-alias', 'creator-identity', 'studio-mark']],
   [RiFilmLine, ['media-repair', 'mp4-header-repair']],
   [RiLinksLine, ['link-check', 'link-prune', 'source-check']],
-  [RiDownloadCloud2Line, ['download-postprocess']],
+  [RiDownloadCloud2Line, ['download-postprocess', 'want-search']],
   [RiHeart3Line, ['taste-refresh']],
   [RiToolsLine, ['upgrade-repairs', 'diagnostic-export', 'amane-bridge', 'face-models', 'ledger-backup', 'ledger-restore']],
 ];

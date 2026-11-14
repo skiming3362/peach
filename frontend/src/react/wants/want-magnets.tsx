@@ -8,7 +8,7 @@ import { Chip } from '@/components/base/badges/chip';
 import { apiGet, apiSend, errorMessage } from '../../api';
 import type { DownloadsSnapshot, DownloadSubmitResult } from '../bundle';
 import { DOWNLOADS_KEY, DOWNLOADS_URL } from '../activity/downloads-panel';
-import { LoadingDots } from '../components/loading-dots';
+import { ActivityStatus } from '../components/activity-motion';
 import { Note } from '../components/note';
 import { busyProps, useAction } from '../settings/use-action';
 import type { Want } from './wants';
@@ -17,6 +17,8 @@ import { Disclosure } from '../settings/section';
 import { cachedResources, rememberResources, resourcesFresh } from './resource-cache';
 import { providerIcon } from '../components/source-label';
 import { resourceNotice, resourceSize } from './resource-display';
+import { codedText, serverLabel } from '../../core/server-text';
+import { editionText } from '../../core/jav-title';
 import { t } from '../../i18n';
 import './want-magnets.css';
 
@@ -24,14 +26,22 @@ export interface MagnetCandidate {
   id: string; protocol: 'magnet' | 'ed2k' | 'url'; info_hash: string; uri: string;
   name: string; size: string; files: string; date: string;
   attributes: string[]; source: string; source_url: string; origins: string[];
+  /** 有译文的来源名带 code（评论区链接的 `source` 是 `javdb-comments`）；`source` 原值仍用来判断条目种类。 */
+  source_code?: string;
 }
 export interface MagnetResult {
   state: 'ready' | 'error' | 'busy' | 'unavailable'; items: MagnetCandidate[];
   error: string; checked_at: string | null; warnings?: string[];
+  error_code?: string; error_params?: Record<string, unknown>;
+  warning_codes?: (string | null)[]; warning_params?: (Record<string, unknown> | null)[];
   source_url?: string;
   cache_stale?: boolean;
   complete?: boolean;
 }
+
+/** 服务端资源的取值（`catalog_vocabulary`）：评论区链接的来源，与列表里不单列的高清属性。 */
+const COMMENT_SOURCE = 'javdb-comments';
+const HD_ATTRIBUTE = 'high-definition';
 
 function ResourceFact({ icon: Icon, children, title }: { icon: ComponentType<{ className?: string; 'aria-hidden'?: boolean | 'true' | 'false' }>; children: ReactNode; title?: string }) {
   return <span title={title} className="inline-flex items-center gap-1"><Icon aria-hidden className="size-(--icon-inline) shrink-0" />{children}</span>;
@@ -95,7 +105,9 @@ export function WantMagnets({ want, readOnly, downloads, provider, toast, onSour
         magnet: candidate.uri, provider: configured.key, target: configured.target,
         code: want.code, title: want.title, origin: queryUrl ? `work:${want.code}` : `wishlist:${want.id}`,
       }, 'POST', signal);
-      if (!result.ok) throw new Error(result.task.failure_detail || result.task.failure_label || t('catalog:wantMagnets.addFailed'));
+      if (!result.ok) throw new Error(codedText(result.task, 'failure_detail')
+        || (result.task.failure_label && serverLabel(`download.failure.${result.task.failure}`, result.task.failure_label))
+        || t('catalog:wantMagnets.addFailed'));
       return result;
     }, (result) => {
       setSubmitted((current) => [...current, candidate.id]);
@@ -108,7 +120,7 @@ export function WantMagnets({ want, readOnly, downloads, provider, toast, onSour
       () => toast(t('catalog:wantMagnets.linkCopied')));
   };
   const waiting = query.isFetching || query.data?.state === 'busy';
-  const failure = query.error ? errorMessage(query.error) : query.data?.error;
+  const failure = query.error ? errorMessage(query.error) : codedText(query.data, 'error');
   return (
     <div ref={root} data-want-magnets="" className="flex min-w-0 flex-col gap-3 border-t border-separator-border pt-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -117,9 +129,11 @@ export function WantMagnets({ want, readOnly, downloads, provider, toast, onSour
           if (!waiting) { refresh.current = true; void query.refetch() }
         }}>{t('catalog:wantMagnets.refresh')}</Button>
       </div>
-      {waiting ? <LoadingDots label={t('catalog:wantMagnets.searching')} /> : null}
+      {/* 还没有结果时是整块面板在等，动画大一档摆在正中；已有结果时换一批，等待留在行内。 */}
+      {waiting ? <ActivityStatus kind="radar" size={query.data?.items.length ? 'inline' : 'block'} label={t('catalog:wantMagnets.searching')} /> : null}
       {failure ? <Note tone="error" title={t('catalog:wantMagnets.notFound')}>{failure}</Note> : null}
-      {query.data?.warnings?.map((warning) => <Note key={warning} tone="neutral">{resourceNotice(warning)}</Note>)}
+      {query.data?.warnings?.map((warning, index) => <Note key={warning} tone="neutral">
+        {serverLabel(query.data?.warning_codes?.[index] ?? '', resourceNotice(warning), query.data?.warning_params?.[index])}</Note>)}
       {query.data?.warnings?.length && query.data.source_url ? <ButtonLink variant="secondary" size="small" className="self-start"
         trailingIcon={RiExternalLinkLine} href={query.data.source_url} target="_blank" rel="noopener noreferrer">{t('catalog:wantMagnets.viewSourcePage')}</ButtonLink> : null}
       {query.data?.state === 'ready' && !query.data.items.length && !query.data.warnings?.length
@@ -138,14 +152,12 @@ export function WantMagnets({ want, readOnly, downloads, provider, toast, onSour
                 <p data-resource-title="" title={candidate.name} className="min-w-0 flex-1 text-body-2-medium text-text-primary">{candidate.name}</p>
               </div>
               <div data-resource-facts="" className="flex flex-wrap gap-x-2 gap-y-1 text-caption-1-regular text-text-secondary">
-                <ResourceFact icon={RiLink}>{candidate.source}</ResourceFact>
+                <ResourceFact icon={RiLink}>{serverLabel(candidate.source_code ?? '', candidate.source)}</ResourceFact>
                 <ResourceFact icon={RiHardDrive2Line} title={candidate.size ? t('catalog:wantMagnets.sourceSize', { size: candidate.size }) : undefined}>{resourceSize(candidate.size)}</ResourceFact>
                 {/* i18n-exempt: 来源给的文件数是内容，只把繁体量词规范成简体 */}
                 {candidate.files ? <ResourceFact icon={RiFileList2Line}>{candidate.files.replaceAll('個', '个')}</ResourceFact> : null}
-                {/* i18n-exempt: 服务端的来源值「JavDB 评论」，只用来比较 */}
-                <ResourceFact icon={RiCalendarLine} title={candidate.source === 'JavDB 评论' ? t('catalog:wantMagnets.commentDate') : t('catalog:wantMagnets.listedDate')}>{candidate.date ? candidate.date.slice(0, 10) : t('catalog:wantMagnets.unknownDate')}</ResourceFact>
-                {/* i18n-exempt: 服务端的资源属性值「高清」，只用来过滤 */}
-                {candidate.attributes.filter(value => value !== '高清').map((value) => <ResourceFact key={value} icon={RiPriceTag3Line}>{value}</ResourceFact>)}
+                <ResourceFact icon={RiCalendarLine} title={candidate.source === COMMENT_SOURCE ? t('catalog:wantMagnets.commentDate') : t('catalog:wantMagnets.listedDate')}>{candidate.date ? candidate.date.slice(0, 10) : t('catalog:wantMagnets.unknownDate')}</ResourceFact>
+                {candidate.attributes.filter(value => value !== HD_ATTRIBUTE).map((value) => <ResourceFact key={value} icon={RiPriceTag3Line}>{editionText(value)}</ResourceFact>)}
               </div>
             </div>
             <div data-resource-actions="" className="flex flex-wrap gap-2">

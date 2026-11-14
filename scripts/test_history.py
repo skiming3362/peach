@@ -21,6 +21,9 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from filelock import FileLock, Timeout
+if str(Path(__file__).resolve().parents[1] / "src") not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from peach.interface_text import dev as t  # noqa: E402
 
 SLOW_SECONDS = 5.0
 SUMMARY_CHARS = 200
@@ -46,7 +49,7 @@ def summary(text: str | None) -> str | None:
 
 def result(test_id: str, outcome: str, seconds: float, message: str | None = None) -> dict:
     if outcome not in OUTCOMES:
-        raise ValueError(f"未知的测试结果：{outcome}")
+        raise ValueError(t("test_history.unknownOutcome", outcome=outcome))
     row = {"id": test_id, "outcome": outcome, "seconds": round(float(seconds), 3)}
     if outcome in {"fail", "error"}:
         row["message"] = summary(message)
@@ -132,7 +135,7 @@ def append(root: Path, *, scope: str, files: list[str], rows: list[dict],
         header = run_header(root, scope, files, len(rows))
         return _write(root, folder, [header, *({"type": "test", "run": header["run"], **row} for row in kept(rows))])
     except (OSError, ValueError, Timeout, subprocess.CalledProcessError) as error:
-        print(f"测试结果历史没有写入（不影响本次判定）：{error}", file=sys.stderr, flush=True)
+        print(t("test_history.historyNotWritten", error=error), file=sys.stderr, flush=True)
         return None
 
 
@@ -145,7 +148,7 @@ def append_flaky(root: Path, selectors: list[str], folder: Path | None = None) -
         line = {key: header[key] for key in ("time", "head", "branch", "worktree", "ci")}
         return _write(root, folder, [{"type": "flaky", **line, "selectors": sorted(selectors)}])
     except (OSError, ValueError, Timeout, subprocess.CalledProcessError) as error:
-        print(f"偶发记录没有写入（不影响本次判定）：{error}", file=sys.stderr, flush=True)
+        print(t("test_history.flakyNotWritten", error=error), file=sys.stderr, flush=True)
         return None
 
 
@@ -191,21 +194,22 @@ def read_records(folders: list[Path]):
 
 def main(argv: list[str] | None = None) -> int:
     import argparse
-    parser = argparse.ArgumentParser(description="测试结果历史的统计")
+    parser = argparse.ArgumentParser(description=t("test_history.description"))
     commands = parser.add_subparsers(dest="command", required=True)
-    flaky = commands.add_parser("flaky", help="按偶发次数排行失败后单独重跑通过的文件")
-    flaky.add_argument("--days", type=int, default=30, help="只看最近几天，默认 30")
+    flaky = commands.add_parser("flaky", help=t("test_history.helpFlaky"))
+    flaky.add_argument("--days", type=int, default=30, help=t("test_history.helpDays"))
     flaky.add_argument("--folder", type=Path, action="append",
-                       help="另读的历史目录，可重复（如下载的 CI 制品）；默认读本机历史")
+                       help=t("test_history.helpFolder"))
     args = parser.parse_args(argv)
     root = Path(__file__).resolve().parents[1]
     folders = args.folder or [history_dir(root)]
     since = time.strftime("%Y-%m-%d", time.localtime(time.time() - args.days * 86400))
     rows = flaky_ranking(read_records(folders), since=since)
     if not rows:
-        print(f"最近 {args.days} 天没有偶发记录。")
+        print(t("test_history.noFlaky", days=args.days))
         return 0
-    print("次数\tCI\t天数\t分支\t最近\t文件")
+    print("\t".join((t("test_history.columnCount"), "CI", t("test_history.columnDays"), t("test_history.columnBranches"),
+                     t("test_history.columnLast"), t("test_history.columnFile"))))
     for row in rows:
         print(f"{row['count']}\t{row['ci']}\t{row['days']}\t{row['branches']}\t{row['last'][:16]}\t{row['selector']}")
     return 0

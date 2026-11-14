@@ -43,7 +43,9 @@ import {
   ErrorText, ExternalLink, Fact, FactList, Footer, Help, Section, SourceMark, Stack,
 } from './section';
 import { busyProps, useAction } from './use-action';
+import { bodyFieldErrors } from '../../core/server-text';
 import { confirmModal } from '@peach/legacy/ui';
+import { pickServerFolder, type FolderReply } from '../components/server-path-dialog';
 import { fetchLibraryProcessing, processingActive, restartEffectText } from '../library-processing/library-processing';
 import { t } from '../../i18n';
 
@@ -63,7 +65,7 @@ const sourceOptions = [...MEDIA_SOURCES, ['smb', t('settings:mediaLibraries.smbS
 /** 媒体库在下拉里的图标：选过就用选的，否则按来源自动识别，和标题行的图标键一致。 */
 const libraryMark = (row: { library_icon: string; location: string; transport?: string }) => row.library_icon || libraryAutoChoice(row.transport === 'smb' ? 'smb' : row.location)[0];
 const pickFolder = async (initial: string) =>
-  (await apiSend<{ path: string | null }>(PICK_FOLDER_URL, { initial })).path;
+  pickServerFolder(initial, body => apiSend<FolderReply>(PICK_FOLDER_URL, body));
 
 interface MediaRow {
   transport: 'smb' | 'filesystem';
@@ -104,7 +106,7 @@ function initialRows(data: ConfigurationData): MediaRow[] {
 
 const fieldErrorsOf = (cause: unknown): FieldErrors | null => {
   if (!(cause instanceof ApiError) || cause.status !== 400) return null;
-  return (cause.body as { errors?: FieldErrors } | null)?.errors ?? null;
+  return bodyFieldErrors<FieldErrors>(cause.body) ?? null;
 };
 
 /* 能编辑时挂载状态标在每个文件夹行上；只读时没有那张表，单列一块。 */
@@ -223,7 +225,7 @@ function MediaForm({ data, receipt }: ConfigurationGroupProps) {
       <Section guide="media" title={t('settings:libraryFolders.title')}>
         <Stack>
           <Note tone="success" title={t('settings:shared.configSaved')}>
-            {t('settings:mediaLibraries.restartingRedirect')}<LinkButton href={saved.url} size="small">{t('settings:mediaLibraries.goToCollection')}</LinkButton>。
+            {t('settings:mediaLibraries.restartingRedirect')}<LinkButton href={saved.url} size="small">{t('settings:mediaLibraries.goToCollection')}</LinkButton>{t('shell:format.period')}
           </Note>
         </Stack>
       </Section>
@@ -364,7 +366,7 @@ function MediaForm({ data, receipt }: ConfigurationGroupProps) {
         {cloud ? <><MediaReadPolicyHelp /><CloudDriveGuide /></> : null}
         {missing.map((dependency) => (
           <Help key={dependency.name}>
-            {t('settings:mediaLibraries.dependencyMissing')} {dependency.name}。<ExternalLink href={dependency.download_url}>{t('settings:shared.download')} {dependency.name}</ExternalLink>
+            {t('settings:mediaLibraries.dependencyMissingName', { name: dependency.name })}{t('shell:format.sentenceGap')}<ExternalLink href={dependency.download_url}>{t('settings:shared.download')} {dependency.name}</ExternalLink>
           </Help>
         ))}
         <Checkbox isSelected={scanNow} onChange={setScanNow}>{t('settings:mediaLibraries.scanAfterSave')}</Checkbox>

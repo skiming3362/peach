@@ -9,7 +9,8 @@ import { busyProps, useAction } from '../settings/use-action';
 import { DiscoveryFaces } from './discovery-faces';
 import { useJavSelection } from './jav-selection';
 import { suppressShiftTextSelection } from '../components/row-click';
-import { COVER_STATE_TITLE, coverFetchingHtml, coverStateAction, coverUrl } from '@peach/card-art';
+import { COVER_STATE_TITLE, coverFetchingHtml, coverReason, coverStateAction, coverUrl } from '@peach/card-art';
+import { ActivityMotion } from '../components/activity-motion';
 import type { DownloadPrefill } from '../activity/cloud-download-dialog';
 import { coverArrived, coverFetching, discoveryArtwork, fetchCoverNow, type Discovery } from './jav';
 import { joinList, t } from '../../i18n';
@@ -28,15 +29,17 @@ function CoverWait({ item, readOnly }: { item: Discovery; readOnly: boolean }) {
   useSyncExternalStore(coverFetching.subscribe, coverFetching.revision);
   const state = item.cover_state;
   if (!state) return <span data-media-nopic="">{t('catalog:shared.noCover')}</span>;
-  // 后台那一批正在取，或者这一部正当场取着（卡上点的、整批插队里轮到的）：不定进度圆环加一句「抓取中」。
+  // 后台那一批正在取，或者这一部正当场取着（卡上点的、整批插队里轮到的）：传输动画加一句「抓取中」。
   if (state === 'fetching' || coverFetching.has(item.code)) return <span dangerouslySetInnerHTML={{ __html: coverFetchingHtml() }} />;
   const retry = () => { void action.run('cover', signal => fetchCoverNow(item.code, signal), result => {
     if (result.has_cover) coverArrived(item.code, result); else setReason(result.message || t('catalog:javDiscovery.noOfficialCover'));
   }) };
   // 当场取过一次没取到，这一格就按这一次的结论说话：标题换成「无封面」，键换成「立即重试」。
   const shown = reason || action.error ? 'missing' : state;
-  const why = action.error || reason || item.cover_reason;
+  const why = action.error || reason || coverReason(item);
   return <div data-cover-state={shown} className="flex max-w-full flex-col items-center gap-1.5 px-4 text-center">
+    {/* 排队的只给静帧：一屏几十张排队的卡同时转，正在抓的那几张反而看不出来。 */}
+    {shown === 'queued' ? <ActivityMotion kind="clock" size="card" still /> : null}
     <span data-media-nopic="">{COVER_STATE_TITLE[shown]}</span>
     {why ? <span className="line-clamp-3 text-caption-1-regular text-text-secondary" title={why}>{why}</span> : null}
     {readOnly ? null : <Button size="small" variant="secondary" className="mt-1" onClick={retry}>

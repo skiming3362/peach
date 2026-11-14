@@ -1,9 +1,11 @@
-/* JAV 用户脚本的默认下载渠道与专用令牌。 */
+/* JAV 用户脚本的默认下载渠道、专用令牌与没搜到资源时是否加入想要。 */
 import { useEffect, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
+import { SettingsRow } from '@/components/application/settings/settings-rows';
 import { Button } from '@/components/base/buttons/button';
 import { Input } from '@/components/base/input/input';
 import { Select, SelectItem } from '@/components/base/select/select';
+import { Switch } from '@/components/base/switch/switch';
 import { apiGet, apiSend, errorMessage } from '../../api';
 import { javBrowserSkeleton, rememberShape } from '../../configuration-skeleton';
 import { SourceLabel } from '../components/source-label';
@@ -15,7 +17,7 @@ import { t } from '../../i18n';
 const URL = '/api/configuration/jav-browser';
 interface State {
   enabled: boolean; provider: string; available: boolean; token?: string;
-  active_provider?: string; problems?: string[];
+  active_provider?: string; problems?: string[]; want_on_no_match: boolean;
   userscript: { version: string; minimum_version: string; install_url: string };
   providers: { key: string; label: string; configured: boolean; target: string }[];
 }
@@ -50,6 +52,14 @@ function BrowserForm({ initial, receipt }: { initial: State; receipt(message: st
       receipt(kind === 'disable' ? t('settings:browserAdd.turnedOff') : t('settings:browserAdd.tokenIssued'));
     });
   };
+  /* 开关跟着账本走，切换即保存；失败时退回原值，报错写在本节底部。 */
+  const saveWant = (enabled: boolean) => {
+    if (action.busy) return;
+    setState(current => ({ ...current, want_on_no_match: enabled }));
+    void action.run('want', signal => apiSend('/api/settings', { javBrowserWantOnNoMatch: enabled }, 'POST', signal),
+      () => receipt(t('settings:shared.settingsSaved')),
+      cause => { setState(current => ({ ...current, want_on_no_match: !enabled })); action.setError(errorMessage(cause)); });
+  };
   const ready = state.providers.some(item => item.key === provider && item.configured && item.target);
   return <Section guide="browser" title={t('settings:javBrowser.title')}>
     <Stack>
@@ -67,6 +77,10 @@ function BrowserForm({ initial, receipt }: { initial: State; receipt(message: st
       {state.problems?.map(problem => <Help key={problem}>{problem}</Help>)}
       {state.enabled && state.active_provider && !state.providers.some(item => item.key === state.active_provider)
         ? <Help>{t('settings:browserAdd.channelUnavailable')}</Help> : null}
+      <div><SettingsRow label={t('settings:browserAdd.wantOnNoMatch')} description={t('settings:browserAdd.wantOnNoMatchHelp')}>
+        <Switch aria-label={t('settings:browserAdd.wantOnNoMatch')} isSelected={state.want_on_no_match}
+          isDisabled={Boolean(action.busy)} onChange={saveWant} />
+      </SettingsRow></div>
       <Input label={t('settings:browserAdd.peachUrl')} value={window.location.origin} isReadOnly autoComplete="off" />
       {token ? <>
         <Input label={t('settings:browserAdd.token')} type="password" value={token} isReadOnly autoComplete="new-password" />
