@@ -52,6 +52,12 @@ ICON_MEANINGS = {
 GENERIC_ICONS = frozenset({"sparkle"})
 
 NOTICES: dict[str, dict] = {
+    "0.59.0": {
+        "level": "notice",
+        "features": [
+            {"id": "junk-batch", "icon": "select", "route": "/junk-files"},
+        ],
+    },
     "0.58.0": {
         "level": "notice",
         "features": [

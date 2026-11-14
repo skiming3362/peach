@@ -279,6 +279,15 @@
           "title": "Full English interface"
         }
       }
+    },
+    "v0-59-0": {
+      "headline": "Handle a whole page of junk files at once",
+      "items": {
+        "junk-batch": {
+          "body": "Enter selection on the count row, then act on the whole page",
+          "title": "Select junk files in bulk"
+        }
+      }
     }
   },
   "repairCenter": {
