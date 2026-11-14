@@ -14,7 +14,6 @@ import subprocess
 import sys
 import urllib.parse
 import urllib.request
-import sys
 import zipfile
 
 if str(Path(__file__).resolve().parents[1] / "src") not in sys.path:
